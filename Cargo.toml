@@ -1,5 +1,5 @@
 [package]
-name = "supervisor-types"
+name = "paraphrase-types"
 version = "0.1.0"
 edition = "2024"
 
