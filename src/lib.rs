@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod asr;
 pub mod auth;
 pub mod credits;
 pub mod edit;
@@ -6,5 +7,6 @@ pub mod entitlements;
 pub mod error;
 pub mod notifications;
 pub mod pricing;
+pub mod recording;
 pub mod user;
 pub mod project;

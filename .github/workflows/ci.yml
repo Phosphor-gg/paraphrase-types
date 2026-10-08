@@ -1,7 +1,11 @@
-name: Cargo Check
+name: CI
 
+# Also on push, because a workflow that only runs on pull_request never guards
+# a commit pushed straight to main.
 on:
   pull_request:
+  push:
+    branches: [main]
 
 jobs:
   check:
@@ -13,6 +17,17 @@ jobs:
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Run cargo check
-        run: cargo check
+        run: cargo check --all-targets
+
+      # The edit model's invariants, the credit unit and the ASR wire contract
+      # are all enforced by tests. Checking without running them means a
+      # mispriced credit or a renamed field reaches main unopposed.
+      - name: Run cargo test
+        run: cargo test --all-targets

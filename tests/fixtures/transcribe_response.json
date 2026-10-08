@@ -1,0 +1,12 @@
+{
+  "words": [
+    { "index": 0, "text": "um",    "start_ms": 120,  "end_ms": 310,  "confidence": 0.41 },
+    { "index": 1, "text": "so",    "start_ms": 360,  "end_ms": 520,  "confidence": 0.88 },
+    { "index": 2, "text": "I",     "start_ms": 560,  "end_ms": 640,  "confidence": 0.97 },
+    { "index": 3, "text": "went",  "start_ms": 650,  "end_ms": 910,  "confidence": 0.99 },
+    { "index": 4, "text": "to",    "start_ms": 930,  "end_ms": 1020, "confidence": 0.98 },
+    { "index": 5, "text": "the",   "start_ms": 1030, "end_ms": 1140, "confidence": 0.96 }
+  ],
+  "language": "en",
+  "duration_ms": 1400
+}

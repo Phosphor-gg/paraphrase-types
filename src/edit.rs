@@ -21,7 +21,7 @@ pub const DEFAULT_PAD_MS: u32 = 30;
 const MAX_REPEATED_RUN: usize = 6;
 
 /// A transcribed word and the span of audio that produced it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Word {
     /// Position in the original transcript. Stable; it is how edits refer to
     /// this word for the life of the recording.
@@ -29,11 +29,20 @@ pub struct Word {
     pub text: String,
     pub start_ms: u32,
     pub end_ms: u32,
+    /// How sure the decoder was, when it says. Drives the editor's highlighting
+    /// of words worth re-listening to; never used to decide a cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 impl Word {
     pub fn new(index: u32, text: impl Into<String>, start_ms: u32, end_ms: u32) -> Self {
-        Self { index, text: text.into(), start_ms, end_ms }
+        Self { index, text: text.into(), start_ms, end_ms, confidence: None }
+    }
+
+    pub fn with_confidence(mut self, confidence: f32) -> Self {
+        self.confidence = Some(confidence);
+        self
     }
 
     pub fn duration_ms(&self) -> u32 {
@@ -42,7 +51,7 @@ impl Word {
 }
 
 /// The words of one recording, in spoken order.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct WordTrack {
     pub words: Vec<Word>,
 }
@@ -558,6 +567,143 @@ pub fn numbered_words(track: &WordTrack) -> String {
         .join(" ")
 }
 
+// ---------------------------------------------------------------------------
+// Candidates: what the rules suspect but cannot decide alone
+// ---------------------------------------------------------------------------
+
+/// Discourse markers whose filler-ness depends entirely on context.
+///
+/// "it tastes *like* chicken" is a comparison and "by *like* Friday" is a tic,
+/// and no rule distinguishes them. These are proposed, never removed outright.
+const AMBIGUOUS_WORDS: &[&str] = &[
+    "like", "basically", "actually", "literally", "really", "just", "so", "well",
+    "right", "okay", "anyway", "obviously", "honestly", "totally", "essentially",
+];
+
+/// Multi-word markers, matched over surviving words so a hesitation between the
+/// halves does not hide them.
+const AMBIGUOUS_PHRASES: &[&[&str]] = &[
+    &["you", "know"],
+    &["i", "mean"],
+    &["sort", "of"],
+    &["kind", "of"],
+    &["you", "see"],
+    &["or", "something"],
+    &["or", "whatever"],
+];
+
+/// A span the rules suspect is filler but will not remove without a judgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Candidate {
+    /// Original word indices, ascending.
+    pub indices: Vec<u32>,
+    /// The words themselves, for the prompt and for the UI.
+    pub text: String,
+}
+
+/// A judgement on one candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Removing it leaves the meaning identical.
+    Filler,
+    /// It carries meaning, or the sentence breaks without it.
+    Content,
+}
+
+/// What a judge is asked about one candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Judgement {
+    pub candidate: Candidate,
+    pub verdict: Verdict,
+}
+
+/// Spans worth asking about, skipping anything already removed.
+///
+/// The indices come from here rather than from a model, which is what makes
+/// index drift unrepresentable: a judge only ever answers "filler" or "content"
+/// about a span this function chose.
+pub fn candidate_spans(track: &WordTrack, removed: &[u32]) -> Vec<Candidate> {
+    let gone: std::collections::HashSet<u32> = removed.iter().copied().collect();
+    let surviving: Vec<u32> =
+        (0..track.len() as u32).filter(|i| !gone.contains(i)).collect();
+    let norm: Vec<String> = surviving
+        .iter()
+        .filter_map(|&i| track.get(i))
+        .map(|w| normalize(&w.text))
+        .collect();
+
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < surviving.len() {
+        // Longest phrase first, so "kind of" is not proposed as a bare "kind".
+        let phrase = AMBIGUOUS_PHRASES.iter().find(|p| {
+            at + p.len() <= surviving.len()
+                && norm[at..at + p.len()].iter().zip(p.iter()).all(|(a, b)| a == b)
+        });
+        if let Some(p) = phrase {
+            let indices: Vec<u32> = surviving[at..at + p.len()].to_vec();
+            out.push(Candidate { text: words_text(track, &indices), indices });
+            at += p.len();
+            continue;
+        }
+        if AMBIGUOUS_WORDS.contains(&norm[at].as_str()) {
+            let indices = vec![surviving[at]];
+            out.push(Candidate { text: words_text(track, &indices), indices });
+        }
+        at += 1;
+    }
+    out
+}
+
+fn words_text(track: &WordTrack, indices: &[u32]) -> String {
+    indices
+        .iter()
+        .filter_map(|&i| track.get(i))
+        .map(|w| w.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The sentence as it currently stands, with the candidate marked.
+///
+/// Words already removed are hidden, so the judge reads the text the listener
+/// would actually hear rather than the raw transcript.
+pub fn judge_context(track: &WordTrack, removed: &[u32], candidate: &Candidate) -> String {
+    let gone: std::collections::HashSet<u32> = removed.iter().copied().collect();
+    let span: std::collections::HashSet<u32> = candidate.indices.iter().copied().collect();
+    let first = candidate.indices.first().copied();
+
+    let mut parts: Vec<String> = Vec::new();
+    for w in &track.words {
+        if Some(w.index) == first {
+            parts.push(format!("<<{}>>", candidate.text));
+        } else if span.contains(&w.index) || gone.contains(&w.index) {
+            continue;
+        } else {
+            parts.push(w.text.clone());
+        }
+    }
+    parts.join(" ")
+}
+
+/// Turn judgements into removals, keeping only the filler verdicts.
+pub fn removals_from_judgements(judged: &[Judgement]) -> Vec<Removal> {
+    let mut out: Vec<Removal> = judged
+        .iter()
+        .filter(|j| j.verdict == Verdict::Filler)
+        .flat_map(|j| {
+            j.candidate
+                .indices
+                .iter()
+                .map(|&index| Removal { index, reason: RemovalReason::Filler })
+        })
+        .collect();
+    out.sort_by_key(|r| r.index);
+    out.dedup_by_key(|r| r.index);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,6 +1165,162 @@ mod tests {
                 Interval { start_ms: 0, end_ms: 100 },
             ]
         );
+    }
+
+    // -- candidates and judgements ------------------------------------------
+
+    #[test]
+    fn an_unambiguous_transcript_raises_no_candidates() {
+        let t = track("the quick brown fox jumps over the lazy dog");
+        assert!(candidate_spans(&t, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_discourse_marker_is_proposed_not_removed() {
+        let t = track("it basically tastes like chicken");
+        let c = candidate_spans(&t, &[]);
+        assert_eq!(
+            c.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["basically", "like"],
+            "both are ambiguous; neither may be cut by rule alone"
+        );
+    }
+
+    #[test]
+    fn a_two_word_marker_is_one_candidate() {
+        let t = track("you know we need more time");
+        let c = candidate_spans(&t, &[]);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].text, "you know");
+        assert_eq!(c[0].indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_phrase_is_preferred_over_its_first_word_alone() {
+        // "kind" is not in the ambiguous word list, but "kind of" is a phrase;
+        // "sort of" would otherwise be proposed as a bare "sort".
+        let t = track("it is sort of hard to say");
+        let c = candidate_spans(&t, &[]);
+        assert_eq!(c[0].text, "sort of");
+        assert_eq!(c[0].indices, vec![2, 3]);
+    }
+
+    #[test]
+    fn candidates_skip_words_already_removed() {
+        let t = track("um so I went");
+        let removals = propose_fillers(&t);
+        let removed: Vec<u32> = removals.iter().map(|r| r.index).collect();
+        let c = candidate_spans(&t, &removed);
+        // "um" is gone by rule; only "so" is left to judge.
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].text, "so");
+    }
+
+    #[test]
+    fn a_hesitation_between_the_halves_does_not_hide_a_phrase() {
+        let t = track("you um know we need more time");
+        let removed: Vec<u32> = propose_fillers(&t).iter().map(|r| r.index).collect();
+        let c = candidate_spans(&t, &removed);
+        assert_eq!(c[0].text, "you know", "matched over surviving words");
+        assert_eq!(c[0].indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn the_judge_sees_the_sentence_as_it_will_be_heard() {
+        let t = track("um so I went to the store");
+        let removed: Vec<u32> = propose_fillers(&t).iter().map(|r| r.index).collect();
+        let c = candidate_spans(&t, &removed);
+        // "um" is hidden because it is already cut, and "so" is marked.
+        assert_eq!(judge_context(&t, &removed, &c[0]), "<<so>> I went to the store");
+    }
+
+    #[test]
+    fn the_judge_context_marks_a_phrase_as_one_unit() {
+        let t = track("so the thing is you know we need time");
+        let c = candidate_spans(&t, &[]);
+        let phrase = c.iter().find(|c| c.text == "you know").unwrap();
+        assert_eq!(
+            judge_context(&t, &[], phrase),
+            "so the thing is <<you know>> we need time"
+        );
+    }
+
+    #[test]
+    fn only_filler_verdicts_become_removals() {
+        let t = track("it basically tastes like chicken");
+        let c = candidate_spans(&t, &[]);
+        let judged = vec![
+            Judgement { candidate: c[0].clone(), verdict: Verdict::Filler },
+            Judgement { candidate: c[1].clone(), verdict: Verdict::Content },
+        ];
+        let mut plan = EditPlan::unedited(&t);
+        apply_removals(&mut plan, &removals_from_judgements(&judged));
+        assert_eq!(plan.text(&t), "it tastes like chicken");
+    }
+
+    #[test]
+    fn a_filler_phrase_verdict_removes_every_word_of_it() {
+        let t = track("you know we need more time");
+        let c = candidate_spans(&t, &[]);
+        let judged = vec![Judgement { candidate: c[0].clone(), verdict: Verdict::Content }];
+        let mut plan = EditPlan::unedited(&t);
+        apply_removals(&mut plan, &removals_from_judgements(&judged));
+        assert_eq!(plan.text(&t), "you know we need more time");
+
+        let judged = vec![Judgement { candidate: c[0].clone(), verdict: Verdict::Filler }];
+        let mut plan = EditPlan::unedited(&t);
+        apply_removals(&mut plan, &removals_from_judgements(&judged));
+        assert_eq!(plan.text(&t), "we need more time");
+    }
+
+    #[test]
+    fn judging_cannot_introduce_a_word() {
+        // The judge's whole output space is two words, neither of which is text.
+        let t = track("it basically tastes like chicken");
+        let c = candidate_spans(&t, &[]);
+        let judged: Vec<Judgement> = c
+            .iter()
+            .map(|c| Judgement { candidate: c.clone(), verdict: Verdict::Filler })
+            .collect();
+        let mut plan = EditPlan::unedited(&t);
+        apply_removals(&mut plan, &removals_from_judgements(&judged));
+        let spoken: Vec<String> = t.words.iter().map(|w| normalize(&w.text)).collect();
+        assert!(plan.text(&t).split_whitespace().all(|w| spoken.contains(&normalize(w))));
+        plan.validate(&t).unwrap();
+    }
+
+    #[test]
+    fn a_verdict_round_trips_as_the_judge_sends_it() {
+        assert_eq!(
+            serde_json::from_str::<Verdict>(r#""filler""#).unwrap(),
+            Verdict::Filler
+        );
+        assert_eq!(
+            serde_json::from_str::<Verdict>(r#""content""#).unwrap(),
+            Verdict::Content
+        );
+    }
+
+    #[test]
+    fn a_word_carries_no_confidence_unless_the_decoder_gave_one() {
+        let w = Word::new(0, "hello", 0, 100);
+        assert_eq!(w.confidence, None);
+        assert_eq!(w.with_confidence(0.92).confidence, Some(0.92));
+    }
+
+    #[test]
+    fn confidence_is_omitted_from_the_wire_when_absent() {
+        let w = Word::new(3, "hello", 0, 100);
+        let json = serde_json::to_string(&w).unwrap();
+        assert!(!json.contains("confidence"), "{json}");
+        assert_eq!(serde_json::from_str::<Word>(&json).unwrap(), w);
+    }
+
+    #[test]
+    fn a_word_deserialises_without_a_confidence_field() {
+        let w: Word =
+            serde_json::from_str(r#"{"index":0,"text":"hi","start_ms":0,"end_ms":100}"#).unwrap();
+        assert_eq!(w.confidence, None);
     }
 
     // -- serde --------------------------------------------------------------
