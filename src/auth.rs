@@ -5,7 +5,6 @@ use uuid::Uuid;
 pub struct Claims {
     pub sub: String,
     pub email: String,
-    pub discord_id: Option<String>,
     pub username: Option<String>,
     pub global_name: Option<String>,
     pub avatar: Option<String>,
@@ -156,7 +155,6 @@ pub struct AuthResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserInfo {
     pub id: String,
-    pub discord_id: Option<String>,
     pub email: String,
     pub username: String,
     pub global_name: Option<String>,

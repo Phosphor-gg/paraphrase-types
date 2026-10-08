@@ -7,7 +7,6 @@ pub struct UserCountResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserProfileResponse {
     pub id: String,
-    pub discord_id: Option<String>,
     pub email: String,
     pub username: String,
     pub global_name: Option<String>,
@@ -24,7 +23,6 @@ pub struct DashboardOverviewResponse {
 pub struct UserProfile {
     pub id: String,
     pub email: String,
-    pub discord_id: Option<String>,
     pub created_at: String,
 }
 
@@ -82,10 +80,5 @@ pub struct TimeSeriesPoint {
 pub struct PublicStatsResponse {
     pub user_count: i64,
     pub user_growth: Vec<TimeSeriesPoint>,
-    pub moderation_requests: Vec<TimeSeriesPoint>,
-    pub moderation_total: i64,
-    pub discord_guilds: i64,
-    pub discord_members: i64,
-    pub guild_growth: Vec<TimeSeriesPoint>,
     pub member_growth: Vec<TimeSeriesPoint>,
 }
