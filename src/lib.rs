@@ -6,3 +6,4 @@ pub mod error;
 pub mod notifications;
 pub mod pricing;
 pub mod user;
+pub mod project;
