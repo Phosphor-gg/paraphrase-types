@@ -592,6 +592,19 @@ const AMBIGUOUS_PHRASES: &[&[&str]] = &[
     &["or", "whatever"],
 ];
 
+/// Words that make a following "you know" or "you see" a real question rather
+/// than a tic: "do you know", "would you see".
+///
+/// A grammatical signal is worth more than a prompt instruction here. A judge
+/// was measured turning "do you know what time it is" into "do what time it is"
+/// even with the contrasting case in its examples, so the span is not proposed
+/// at all rather than proposed and hopefully declined. Apostrophes are already
+/// stripped by [`normalize`], so "don't" arrives as "dont".
+const INTERROGATIVE_LEADS: &[&str] = &[
+    "do", "dont", "did", "didnt", "does", "doesnt", "would", "wouldnt", "will", "wont",
+    "can", "cant", "could", "couldnt", "should", "shouldnt", "if", "whether", "unless",
+];
+
 /// A span the rules suspect is filler but will not remove without a judgement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
@@ -642,8 +655,14 @@ pub fn candidate_spans(track: &WordTrack, removed: &[u32]) -> Vec<Candidate> {
                 && norm[at..at + p.len()].iter().zip(p.iter()).all(|(a, b)| a == b)
         });
         if let Some(p) = phrase {
-            let indices: Vec<u32> = surviving[at..at + p.len()].to_vec();
-            out.push(Candidate { text: words_text(track, &indices), indices });
+            // "do you know ..." is a question; only a bare "you know" is a tic.
+            let interrogative = p.first() == Some(&"you")
+                && at > 0
+                && INTERROGATIVE_LEADS.contains(&norm[at - 1].as_str());
+            if !interrogative {
+                let indices: Vec<u32> = surviving[at..at + p.len()].to_vec();
+                out.push(Candidate { text: words_text(track, &indices), indices });
+            }
             at += p.len();
             continue;
         }
@@ -1243,6 +1262,47 @@ mod tests {
             judge_context(&t, &[], phrase),
             "so the thing is <<you know>> we need time"
         );
+    }
+
+    #[test]
+    fn a_question_is_not_a_tic() {
+        // Measured: a judge turned "do you know what time it is" into "do what
+        // time it is". The grammar settles it, so the span is never proposed.
+        for q in [
+            "do you know what time it is",
+            "did you know about this",
+            "would you know where it is",
+            "I cant tell if you know the answer",
+        ] {
+            let t = track(q);
+            let c = candidate_spans(&t, &[]);
+            assert!(
+                !c.iter().any(|c| c.text.to_lowercase() == "you know"),
+                "{q:?} proposed \"you know\" as filler: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_you_know_is_still_proposed() {
+        let t = track("you know we need more time");
+        let c = candidate_spans(&t, &[]);
+        assert_eq!(c[0].text, "you know");
+    }
+
+    #[test]
+    fn a_you_know_mid_sentence_is_still_proposed() {
+        let t = track("the thing is you know we need more time");
+        let c = candidate_spans(&t, &[]);
+        assert!(c.iter().any(|c| c.text == "you know"), "{c:?}");
+    }
+
+    #[test]
+    fn the_interrogative_guard_does_not_swallow_other_phrases() {
+        // Only phrases starting with "you" are affected.
+        let t = track("do I mean it");
+        let c = candidate_spans(&t, &[]);
+        assert!(c.iter().any(|c| c.text == "I mean"), "{c:?}");
     }
 
     #[test]
