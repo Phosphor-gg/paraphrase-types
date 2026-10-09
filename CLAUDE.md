@@ -18,25 +18,35 @@ list, so the model was never asked about the things a person most wants gone.
 
 ## What makes that safe
 
-`edit::bind_edit` and nothing else. Every word of the model's reply must claim
-one not-yet-claimed word from the passage, and the edit is the sequence of
-original indices those claims land on.
+The representation, in two shapes. Neither is a validation pass bolted on
+afterwards: "never invent a word" is a property of the type, because an
+`EditPlan` holds indices and there is no index for a word that was never spoken.
+
+`edit::apply_cuts` is what the cleanup service uses. The model replies with
+quotations to delete; each quote selects one run of the passage, and the edit is
+every index no quote claimed. A quote that matches nothing selects nothing, and a
+quote that matches in several separated places is **dropped**, because deleting
+one occurrence says something different from deleting another and the quote does
+not say which was meant. Subtraction from a set cannot add a member, so the
+result is always a subsequence of the passage's own indices. The cost is real:
+a cut list cannot reorder, and quoting both copies of an accidental repetition
+deletes both.
+
+`edit::bind_edit` is the free-text path, for a model that will not emit JSON.
+Every word of the reply must claim one not-yet-claimed word from the passage, and
+the edit is the sequence of indices those claims land on.
 
 - Deleting is a word left unclaimed.
 - Reordering is claims made out of order.
 - A word nobody said has nothing to claim, so the reply is **rejected**.
-
-So "never invent a word" is not an instruction the model is trusted to follow,
-and not a validation pass bolted on afterwards. It is a property of the
-representation: an `EditPlan` holds indices, and there is no index for a word
-that was never spoken.
 
 **An unbindable reply is an error, never a deletion.** This is the single most
 important line in this crate. `~/Documents/Github/voice-cleaner` is an earlier
 prototype that got it wrong: it diffed the model's prose against the transcript
 and cut everything the diff called `replace`, so whenever the model rephrased
 instead of cutting, real speech was silently removed and nothing could detect
-it. If you find yourself treating an unmatched word as a cut, stop.
+it. If you find yourself treating an unmatched word, or an unplaceable quote, as
+a cut, stop.
 
 ## Other things worth knowing
 

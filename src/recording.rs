@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::edit::{EditPlan, Removal, Word};
+use crate::edit::{EditPlan, RejectedCut, Removal, Word};
 
 /// Largest upload accepted, enforced on arriving bytes rather than on
 /// `Content-Length`, which a client controls.
@@ -210,6 +210,18 @@ pub struct CleanResponse {
     /// audibly worse than a deletion and a person should hear it first.
     pub reordered: bool,
     pub edited_duration_ms: u32,
+    /// Cuts the model asked for that could not be placed, so they were not made.
+    ///
+    /// A dropped quote is a cut the person asked for and did not get, and it is
+    /// the only signal that the reply was worse than it looks: the edit itself
+    /// is structurally identical whether the model quoted well or badly.
+    pub cuts_rejected: Vec<RejectedCut>,
+    /// Windows left exactly as recorded because nothing usable came back.
+    ///
+    /// Travels with the response rather than staying in the log: the person is
+    /// about to review this edit, and a passage that was never cleaned looks
+    /// identical to one the model judged already clean.
+    pub windows_failed: usize,
 }
 
 /// Audio formats a cut can be delivered in.
@@ -460,6 +472,27 @@ mod tests {
     fn a_clean_request_needs_no_fields() {
         let r: CleanRequest = serde_json::from_str("{}").unwrap();
         assert_eq!(r.max_gap_ms, None);
+    }
+
+    #[test]
+    fn a_clean_response_carries_what_the_cleanup_did_not_manage() {
+        // Both of these were only in the log before, so a gutted recording and
+        // an already-clean one reached the editor looking the same.
+        let response = CleanResponse {
+            plan: EditPlan { kept: vec![0, 1], max_gap_ms: None, pad_ms: 30 },
+            removed: vec![],
+            reordered: false,
+            edited_duration_ms: 200,
+            cuts_rejected: vec![crate::edit::RejectedCut {
+                ordinal: 0,
+                quote: "the".into(),
+                error: crate::edit::CutError::Ambiguous { occurrences: 2 },
+            }],
+            windows_failed: 1,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("cuts_rejected") && json.contains("windows_failed"), "{json}");
+        assert_eq!(serde_json::from_str::<CleanResponse>(&json).unwrap(), response);
     }
 
     #[test]

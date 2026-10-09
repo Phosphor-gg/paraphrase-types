@@ -17,8 +17,15 @@
 //! discourse markers and asked a model only to adjudicate the spans those lists
 //! found. That bounded the AI's recall by the lists: a rambling clause, a
 //! redundant restatement or a worthwhile reordering is on no list, so the model
-//! was never even asked. The model now decides everything, and
-//! [`bind_edit`] is what keeps that safe.
+//! was never even asked. The model now decides everything, and nothing it says
+//! is trusted: there are two ways to ask it, and each one is safe by
+//! construction rather than by validation.
+//!
+//! [`apply_cuts`] takes a list of quotations to delete and returns the indices
+//! the quotes did not claim, so the AI's output space is subtraction from a set.
+//! [`bind_edit`] takes the passage rewritten as free text and makes every word
+//! of it claim one not-yet-claimed original word, which also allows reordering
+//! and costs the whole window when one word will not bind.
 
 use serde::{Deserialize, Serialize};
 
@@ -460,6 +467,263 @@ pub fn is_reordered(kept: &[u32]) -> bool {
     kept.windows(2).any(|w| w[0] >= w[1])
 }
 
+// ---------------------------------------------------------------------------
+// Cutting by quotation
+// ---------------------------------------------------------------------------
+
+/// The model's reply on the cut path: the pieces of the passage it wants gone,
+/// quoted from the passage itself.
+///
+/// Deletion is the only operation the format has, which is why this is one
+/// field of strings and not a patch language. `{"cuts": []}` is the ordinary
+/// answer for a passage already clean.
+///
+/// Unknown fields are *not* denied here, unlike [`Word`]: that shape comes from
+/// the GPU service, where a renamed field has to fail loudly, while this one
+/// comes from a language model, where an extra chatty key is noise and refusing
+/// the whole reply over it would throw away a usable edit.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CutList {
+    pub cuts: Vec<String>,
+}
+
+/// A run of the track one accepted cut removes, in absolute [`Word::index`]
+/// values, half-open.
+///
+/// Absolute to match [`bind_edit`]'s convention, half-open to match
+/// [`chunk_ranges`], so a window into the middle of a recording needs no offset
+/// arithmetic at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CutSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Why one quote was not cut.
+///
+/// A refusal leaves those words in the recording, so every variant here is the
+/// safe outcome of the pair: keeping a word someone wanted gone costs them one
+/// click, and cutting a word they wanted removes audio they may not notice is
+/// missing until they listen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum CutError {
+    /// The quote normalises to nothing: `"..."`, or whitespace.
+    NoWords,
+    /// No contiguous run of the passage reads like this. The usual cause is a
+    /// model paraphrasing the words it meant to quote.
+    NotFound,
+    /// Several runs match and they are not all adjacent, so which one was meant
+    /// changes what the passage says. The quote carries nothing to choose with.
+    Ambiguous { occurrences: usize },
+    /// Every matching run is already covered by an accepted cut. Also how a
+    /// duplicated entry lands.
+    AlreadyCut,
+    /// The quote names every word of the passage, which is a summary refusing
+    /// to be one rather than an edit.
+    WholeWindow,
+}
+
+impl std::fmt::Display for CutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoWords => write!(f, "has no words in it"),
+            Self::NotFound => write!(f, "does not occur in this passage"),
+            Self::Ambiguous { occurrences } => write!(
+                f,
+                "occurs {occurrences} times in different places, and which was meant \
+                 changes what the passage says"
+            ),
+            Self::AlreadyCut => write!(f, "is already covered by a cut"),
+            Self::WholeWindow => write!(f, "is the whole passage"),
+        }
+    }
+}
+
+impl std::error::Error for CutError {}
+
+/// A quote that was dropped, kept verbatim with its reason.
+///
+/// The text is stored as the model wrote it so a log line or a prompt change
+/// has the actual string to look at, and `ordinal` is its position in the reply
+/// so a rejection can be shown next to the entry that caused it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedCut {
+    pub ordinal: usize,
+    pub quote: String,
+    pub error: CutError,
+}
+
+impl std::fmt::Display for RejectedCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} {}", self.quote, self.error)
+    }
+}
+
+/// What a cut list did to one window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutOutcome {
+    /// Original indices that survive, in recorded order.
+    pub kept: Vec<u32>,
+    pub applied: Vec<CutSpan>,
+    pub rejected: Vec<RejectedCut>,
+}
+
+/// Find the one run of the window a quote names.
+///
+/// Matching is over the window's *content* words, each passed through
+/// [`normalize`], so a quote survives re-punctuation and case and the two AI
+/// paths cannot drift on what counts as the same word. `claimed` marks window
+/// positions already taken by an accepted cut; a shorter slice than the window,
+/// `&[]` included, means those positions are free.
+///
+/// The returned range is window positions, half-open, and spans from the first
+/// matched word to the last, so a punctuation-only word sitting inside the
+/// phrase is swallowed with it.
+///
+/// ADJACENCY IS AN IDENTITY, NOT A PREFERENCE. When a quote occupies two runs
+/// back to back, deleting either leaves the same sequence of words, so there is
+/// nothing to get wrong and the earliest is taken. Occurrences separated by
+/// other words give different sequences, and the quote says nothing about which
+/// was meant, so they are refused. Without this rule the commonest false start
+/// in speech, "I went to the I went to the station", is ambiguous and survives
+/// untouched.
+///
+/// Taking the earliest of an adjacent run is a hypothesis about audio rather
+/// than a measurement: in a stutter the aborted attempt comes first and the
+/// clean one second, so the later should sound better. The kept text is
+/// identical either way.
+///
+/// There is deliberately no minimum quote length, no stopword list and no fuzzy
+/// matching. Length is only a proxy for uniqueness and uniqueness is checked
+/// directly, so a one-word quote is as safe as a ten-word one, and a floor
+/// would refuse the one-word quotes a model actually produces for "uh" and
+/// "basically".
+pub fn locate_cut(
+    window: &[Word],
+    quote: &str,
+    claimed: &[bool],
+) -> Result<std::ops::Range<usize>, CutError> {
+    let content: Vec<(usize, String)> = window
+        .iter()
+        .enumerate()
+        .filter_map(|(position, word)| {
+            let normalised = normalize(&word.text);
+            (!normalised.is_empty()).then_some((position, normalised))
+        })
+        .collect();
+
+    let needle: Vec<String> = quote
+        .split_whitespace()
+        .map(normalize)
+        .filter(|n| !n.is_empty())
+        .collect();
+    if needle.is_empty() {
+        return Err(CutError::NoWords);
+    }
+    if needle.len() > content.len() {
+        return Err(CutError::NotFound);
+    }
+
+    // The scan does not skip past a hit, so a self-overlapping quote like "the
+    // the" in "the the the" is seen as the several overlapping choices it
+    // really is and refused below, rather than silently resolved.
+    let hits: Vec<std::ops::Range<usize>> = (0..=content.len() - needle.len())
+        .filter(|&at| {
+            content[at..at + needle.len()].iter().zip(&needle).all(|((_, w), n)| w == n)
+        })
+        .map(|at| content[at].0..content[at + needle.len() - 1].0 + 1)
+        .collect();
+    if hits.is_empty() {
+        return Err(CutError::NotFound);
+    }
+
+    let free: Vec<std::ops::Range<usize>> = hits
+        .into_iter()
+        .filter(|hit| !hit.clone().any(|p| claimed.get(p).copied().unwrap_or(false)))
+        .collect();
+    let Some(chosen) = free.first().cloned() else {
+        return Err(CutError::AlreadyCut);
+    };
+    if free.len() > 1 && !free.windows(2).all(|pair| pair[0].end == pair[1].start) {
+        return Err(CutError::Ambiguous { occurrences: free.len() });
+    }
+    if chosen.clone().filter(|&p| !normalize(&window[p].text).is_empty()).count()
+        == content.len()
+    {
+        return Err(CutError::WholeWindow);
+    }
+    Ok(chosen)
+}
+
+/// Apply a cut list to a window, dropping the entries that cannot be placed
+/// exactly once.
+///
+/// This is the whole safety mechanism of the cut path, and it is structural
+/// rather than a validation pass. `kept` holds `u32` taken only from
+/// [`Word::index`]; the reply holds `String` and nothing parses one into the
+/// other. A quote is a query that selects positions, the output is the
+/// complement of the positions it selected, and subtracting from a set cannot
+/// add a member. So for any cut list whatsoever, including an adversarial one,
+/// the result is a subsequence of the window's own indices in recorded order:
+/// a word nobody said is not forbidden here, it is unrepresentable. Reordering
+/// is unrepresentable for the same reason, which is a real narrowing of what
+/// the AI may propose, not a formality.
+///
+/// Total and infallible on purpose. No input can fail the whole call, so
+/// partial application is in the signature rather than in a convention: a
+/// refused quote claims nothing, its words survive, and every other entry still
+/// applies. Nothing in the refusal path can ever cut *more* than was asked for,
+/// because two overlapping quotes drop the second rather than cutting the union.
+///
+/// Entries are located against the pristine window, never against text
+/// progressively rewritten by earlier cuts; only the claimed-position set
+/// accumulates. Order therefore matters solely for which entry wins a contested
+/// span, and reply order is the model's own ranking.
+pub fn apply_cuts(window: &[Word], cuts: &[String]) -> CutOutcome {
+    let mut claimed = vec![false; window.len()];
+    let mut applied = Vec::new();
+    let mut rejected = Vec::new();
+
+    for (ordinal, quote) in cuts.iter().enumerate() {
+        match locate_cut(window, quote, &claimed) {
+            Ok(span) => {
+                applied.push(CutSpan {
+                    start: window[span.start].index,
+                    end: window[span.end - 1].index + 1,
+                });
+                for position in span {
+                    claimed[position] = true;
+                }
+            }
+            Err(error) => {
+                rejected.push(RejectedCut { ordinal, quote: quote.clone(), error })
+            }
+        }
+    }
+
+    let kept = window
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| !claimed[*position])
+        .map(|(_, word)| word.index)
+        .collect();
+
+    CutOutcome { kept, applied, rejected }
+}
+
+/// Whether any word with audio survives a cut list.
+///
+/// A window-level check, because the per-quote [`CutError::WholeWindow`] guard
+/// only sees one entry at a time and two entries can cover a passage between
+/// them.
+pub fn keeps_any_word(window: &[Word], kept: &[u32]) -> bool {
+    let surviving: std::collections::HashSet<u32> = kept.iter().copied().collect();
+    window
+        .iter()
+        .any(|w| surviving.contains(&w.index) && !normalize(&w.text).is_empty())
+}
+
 /// Split a track into windows to edit separately.
 ///
 /// A whole recording in one prompt degrades the model's attention to any
@@ -661,6 +925,322 @@ mod tests {
         let t = track("zero one two three four five");
         let kept = bind_edit(&t.words[3..], "three five").unwrap();
         assert_eq!(kept, vec![3, 5]);
+    }
+
+    // -- cutting by quotation -----------------------------------------------
+
+    fn quotes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The cut path's kept indices as text, which is what a person hears.
+    fn cut_text(t: &WordTrack, cuts: &[&str]) -> String {
+        let outcome = apply_cuts(&t.words, &quotes(cuts));
+        EditPlan { kept: outcome.kept, max_gap_ms: None, pad_ms: 0 }.text(t)
+    }
+
+    fn reasons(t: &WordTrack, cuts: &[&str]) -> Vec<CutError> {
+        apply_cuts(&t.words, &quotes(cuts)).rejected.into_iter().map(|r| r.error).collect()
+    }
+
+    #[test]
+    fn a_cut_list_can_only_remove_words_that_were_spoken() {
+        let t = track("um so I basically went to the store yesterday");
+        let outcome = apply_cuts(&t.words, &quotes(&["um so", "basically"]));
+        let plan = EditPlan { kept: outcome.kept, max_gap_ms: None, pad_ms: 30 };
+        plan.validate(&t).unwrap();
+        assert_eq!(plan.text(&t), "I went to the store yesterday");
+        for word in plan.text(&t).split_whitespace() {
+            assert!(spoken(&t).contains(&normalize(word)), "{word:?} was not spoken");
+        }
+    }
+
+    #[test]
+    fn an_invented_quote_cuts_nothing_at_all() {
+        // The failure that made the earlier prototype unusable, in the shape
+        // this format can take it: a model that paraphrases what it meant to
+        // quote must not cut whatever sits nearest.
+        let t = track("um so I went to the store");
+        let outcome = apply_cuts(&t.words, &quotes(&["strolled to the store"]));
+        assert_eq!(outcome.kept, (0..7).collect::<Vec<u32>>());
+        assert!(outcome.applied.is_empty());
+        assert_eq!(outcome.rejected[0].error, CutError::NotFound);
+    }
+
+    #[test]
+    fn an_ambiguous_quote_is_refused_and_its_words_survive() {
+        // "the" twice, separated: deleting one says something different from
+        // deleting the other, and the quote does not say which was meant.
+        let t = track("the cat sat on the mat");
+        assert_eq!(cut_text(&t, &["the"]), "the cat sat on the mat");
+        assert_eq!(reasons(&t, &["the"]), vec![CutError::Ambiguous { occurrences: 2 }]);
+    }
+
+    #[test]
+    fn overlapping_occurrences_are_refused_even_though_either_would_do() {
+        // Conservative on purpose: both choices here leave "the the cat", so
+        // the refusal costs recall, and widening the rule to notice that is how
+        // a locator stops being provable.
+        let t = track("the the the cat");
+        assert_eq!(reasons(&t, &["the the"]), vec![CutError::Ambiguous { occurrences: 2 }]);
+        assert_eq!(cut_text(&t, &["the the"]), "the the the cat");
+    }
+
+    #[test]
+    fn an_adjacent_repetition_is_cut_once_because_either_copy_leaves_the_same_words() {
+        // The commonest false start in speech. The quote matches twice, back to
+        // back, and deleting either leaves the identical sequence, so there is
+        // nothing to get wrong. Refusing it here would leave the passage
+        // verbatim and lose the case outright.
+        let t = track("I went to the I went to the station");
+        assert_eq!(cut_text(&t, &["I went to the"]), "I went to the station");
+        let outcome = apply_cuts(&t.words, &quotes(&["I went to the"]));
+        assert_eq!(outcome.applied, vec![CutSpan { start: 0, end: 4 }]);
+        assert!(outcome.rejected.is_empty());
+    }
+
+    #[test]
+    fn a_periodic_repetition_is_cut_once() {
+        let t = track("we should ship it we should ship it we should ship it");
+        assert_eq!(cut_text(&t, &["we should ship it"]), "we should ship it we should ship it");
+    }
+
+    #[test]
+    fn a_one_word_quote_is_fine_when_it_occurs_once() {
+        // No length floor: length is only a proxy for uniqueness, and
+        // uniqueness is checked directly.
+        let t = track("it basically tastes like chicken");
+        assert_eq!(cut_text(&t, &["basically"]), "it tastes like chicken");
+    }
+
+    #[test]
+    fn quoting_both_copies_of_a_repetition_cuts_both() {
+        // Stated rather than fixed, and the one place this format is worse than
+        // free text: a quote cannot distinguish "delete this span" from
+        // "collapse this repetition", so a model that quotes both copies loses
+        // the words the speaker meant to say. The prompt pushes one-copy
+        // quotes; a locator rule that halved a doubled quote would make the
+        // format's single semantic untrue, and "very very" is a real case where
+        // both copies should go.
+        let t = track("I I went to the shop");
+        assert_eq!(cut_text(&t, &["I"]), "I went to the shop");
+        assert_eq!(cut_text(&t, &["I I"]), "went to the shop");
+    }
+
+    #[test]
+    fn a_punctuation_only_quote_has_nothing_to_cut() {
+        let t = track("um so I went to the store");
+        assert_eq!(reasons(&t, &["..."]), vec![CutError::NoWords]);
+        assert_eq!(reasons(&t, &["   "]), vec![CutError::NoWords]);
+    }
+
+    #[test]
+    fn punctuation_inside_a_quote_is_swallowed_and_outside_it_survives() {
+        // A word carrying no letters carries no audio worth keeping on its own,
+        // so it goes with the phrase it sits inside; a dash the quote stops
+        // short of is left where it is.
+        let t = track("so what I wanted to say is -- the deadline is Friday");
+        assert_eq!(cut_text(&t, &["what I wanted to say is -- the"]), "so deadline is Friday");
+        assert_eq!(cut_text(&t, &["so what I wanted to say is"]), "-- the deadline is Friday");
+    }
+
+    #[test]
+    fn a_quote_naming_the_whole_passage_is_refused() {
+        // Measured on qwen3:8b: a model asked to clean a short sentence
+        // sometimes quotes all of it, which is a summary refusing to be one.
+        let t = track("hello world");
+        assert_eq!(reasons(&t, &["hello world"]), vec![CutError::WholeWindow]);
+        let punctuated = track("hello . world");
+        assert_eq!(reasons(&punctuated, &["hello . world"]), vec![CutError::WholeWindow]);
+    }
+
+    #[test]
+    fn a_duplicate_entry_is_dropped_rather_than_cutting_twice() {
+        let t = track("um so I went to the store");
+        let outcome = apply_cuts(&t.words, &quotes(&["um so", "um so"]));
+        assert_eq!(outcome.applied, vec![CutSpan { start: 0, end: 2 }]);
+        assert_eq!(outcome.rejected[0].error, CutError::AlreadyCut);
+        assert_eq!(
+            EditPlan { kept: outcome.kept, max_gap_ms: None, pad_ms: 0 }.text(&t),
+            "I went to the store"
+        );
+    }
+
+    #[test]
+    fn one_bad_entry_does_not_cost_the_good_ones() {
+        // The whole motivation for leaving free text: there, one unbindable
+        // word lost the entire window to verbatim.
+        let t = track("um so I basically went to the uh store yesterday");
+        let outcome =
+            apply_cuts(&t.words, &quotes(&["um so", "hurried", "basically", "uh"]));
+        assert_eq!(
+            EditPlan { kept: outcome.kept, max_gap_ms: None, pad_ms: 0 }.text(&t),
+            "I went to the store yesterday"
+        );
+        assert_eq!(outcome.applied.len(), 3);
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].ordinal, 1, "the rejection names the entry");
+        assert_eq!(outcome.rejected[0].quote, "hurried");
+    }
+
+    #[test]
+    fn two_overlapping_quotes_cut_the_first_not_the_union() {
+        // Nothing in the refusal path may ever cut more than was asked for.
+        let t = track("the plan is we freeze writes on Friday");
+        let outcome = apply_cuts(&t.words, &quotes(&["plan is we", "is we freeze"]));
+        assert_eq!(
+            EditPlan { kept: outcome.kept, max_gap_ms: None, pad_ms: 0 }.text(&t),
+            "the freeze writes on Friday"
+        );
+        assert_eq!(outcome.rejected[0].error, CutError::AlreadyCut);
+    }
+
+    #[test]
+    fn an_empty_cut_list_changes_nothing() {
+        // The ordinary answer for a clean passage, and distinguishable from an
+        // unusable reply, which is why this path needs no sentinel phrase.
+        let t = track("the quick brown fox jumps over the lazy dog");
+        let outcome = apply_cuts(&t.words, &[]);
+        assert_eq!(outcome.kept, (0..9).collect::<Vec<u32>>());
+        assert!(outcome.applied.is_empty() && outcome.rejected.is_empty());
+        assert!(EditPlan { kept: outcome.kept, max_gap_ms: None, pad_ms: 0 }.is_unedited(&t));
+    }
+
+    #[test]
+    fn re_punctuation_and_case_do_not_break_a_quote() {
+        let t = WordTrack::new(vec![
+            Word::new(0, "Um,", 0, 100),
+            Word::new(1, "so", 100, 200),
+            Word::new(2, "I", 200, 300),
+            Word::new(3, "went", 300, 400),
+        ]);
+        assert_eq!(cut_text(&t, &["um so"]), "I went");
+    }
+
+    #[test]
+    fn a_cut_list_cannot_reorder_anything() {
+        // A capability the cut format genuinely gives up: `kept` is the window
+        // minus a set, so it is always in recorded order whatever the model
+        // asks for. `move_word` and the hand editor still reorder.
+        let t = track("because it was raining we stayed in");
+        let outcome = apply_cuts(&t.words, &quotes(&["we stayed in because it was raining"]));
+        assert!(!is_reordered(&outcome.kept));
+        assert_eq!(outcome.rejected[0].error, CutError::NotFound, "not a reorder, a non-match");
+    }
+
+    #[test]
+    fn a_window_yields_absolute_indices() {
+        let t = track("zero one two three four five");
+        let outcome = apply_cuts(&t.words[3..], &quotes(&["four"]));
+        assert_eq!(outcome.kept, vec![3, 5]);
+        assert_eq!(outcome.applied, vec![CutSpan { start: 4, end: 5 }]);
+    }
+
+    #[test]
+    fn a_rejection_prints_the_quote_that_caused_it() {
+        let t = track("the cat sat on the mat");
+        let rejected = apply_cuts(&t.words, &quotes(&["the"])).rejected;
+        let message = rejected[0].to_string();
+        assert!(message.contains("\"the\""), "{message:?} should quote the text");
+        assert!(message.contains("occurs 2 times"), "{message:?} should say why");
+    }
+
+    #[test]
+    fn a_window_cut_to_nothing_is_detectable_even_when_no_entry_was_refused() {
+        // The per-quote whole-passage guard sees one entry at a time, so two
+        // entries can still cover a passage between them. Measured on qwen3:8b.
+        let t = track("um so I went to the store");
+        let outcome = apply_cuts(&t.words, &quotes(&["um so I went", "to the store"]));
+        assert!(outcome.rejected.is_empty());
+        assert!(!keeps_any_word(&t.words, &outcome.kept));
+        assert!(keeps_any_word(&t.words, &apply_cuts(&t.words, &quotes(&["um so"])).kept));
+    }
+
+    #[test]
+    fn punctuation_left_alone_does_not_count_as_a_surviving_word() {
+        // Otherwise a gutted window looks survivable because a comma is left.
+        let t = track("um -- uh");
+        let outcome = apply_cuts(&t.words, &quotes(&["um", "uh"]));
+        assert_eq!(outcome.kept, vec![1]);
+        assert!(!keeps_any_word(&t.words, &outcome.kept));
+    }
+
+    #[test]
+    fn any_cut_list_at_all_yields_a_subsequence_of_the_window() {
+        // The invariant as a property rather than a case. Adversarial quotes:
+        // real slices, reversed slices, invented words, overlaps, repeats,
+        // punctuation, the whole passage.
+        let t = track("um so I think the budget is 40000 pounds which is a lot of money");
+        let passage = t.text();
+        let words: Vec<&str> = passage.split_whitespace().collect();
+        let mut seed = 0x5DEECE66u64;
+        let mut next = move |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+
+        for _ in 0..2000 {
+            let cuts: Vec<String> = (0..next(5))
+                .map(|_| {
+                    let at = next(words.len());
+                    let len = 1 + next(5);
+                    let mut piece: Vec<String> = words[at..(at + len).min(words.len())]
+                        .iter()
+                        .map(|w| w.to_string())
+                        .collect();
+                    match next(6) {
+                        0 => piece.push("subsequently".into()),
+                        1 => piece.reverse(),
+                        2 => piece.push("...".into()),
+                        3 => piece = words.iter().map(|w| w.to_string()).collect(),
+                        _ => {}
+                    }
+                    piece.join(" ")
+                })
+                .collect();
+
+            let outcome = apply_cuts(&t.words, &cuts);
+            let plan = EditPlan { kept: outcome.kept.clone(), max_gap_ms: None, pad_ms: 0 };
+            plan.validate(&t).expect("a cut list cannot produce an invalid plan");
+            assert!(!is_reordered(&outcome.kept), "cuts cannot reorder: {cuts:?}");
+            assert!(
+                outcome.kept.windows(2).all(|w| w[0] < w[1]),
+                "kept must be strictly increasing: {cuts:?}"
+            );
+            for &i in &outcome.kept {
+                assert!(t.get(i).is_some(), "kept an index outside the window: {cuts:?}");
+            }
+            for span in &outcome.applied {
+                assert!(span.start < span.end && (span.end as usize) <= t.len());
+            }
+            assert_eq!(
+                outcome.applied.len() + outcome.rejected.len(),
+                cuts.len(),
+                "every entry is either applied or reported: {cuts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_parses_even_with_an_extra_field() {
+        // The producer is a language model, so a chatty key is noise; refusing
+        // the reply over it would throw away a usable edit.
+        let list: CutList =
+            serde_json::from_str(r#"{"cuts":["um so"],"note":"I cut the filler"}"#).unwrap();
+        assert_eq!(list.cuts, vec!["um so".to_string()]);
+        assert_eq!(serde_json::from_str::<CutList>(r#"{"cuts":[]}"#).unwrap().cuts.len(), 0);
+    }
+
+    #[test]
+    fn a_rejected_cut_survives_a_round_trip_to_the_editor() {
+        let rejected = RejectedCut {
+            ordinal: 2,
+            quote: "the".into(),
+            error: CutError::Ambiguous { occurrences: 3 },
+        };
+        let json = serde_json::to_string(&rejected).unwrap();
+        assert!(json.contains(r#""kind":"ambiguous""#), "{json}");
+        assert_eq!(serde_json::from_str::<RejectedCut>(&json).unwrap(), rejected);
     }
 
     // -- windows ------------------------------------------------------------
