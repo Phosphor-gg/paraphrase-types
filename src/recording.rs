@@ -159,6 +159,19 @@ pub struct CreateRecordingRequest {
     pub name: String,
 }
 
+/// Transcribe something that already exists somewhere else.
+///
+/// The secondary feature: the primary one is recording your own voice. The
+/// server fetches the audio, so the URL is validated against pointing back at
+/// private infrastructure before anything is fetched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateFromUrlRequest {
+    pub url: String,
+    /// Left out, the fetched media's own title is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// Save a hand-made edit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavePlanRequest {
@@ -430,6 +443,19 @@ mod tests {
         assert_eq!(AudioFormat::default(), AudioFormat::Mp3);
     }
 
+    #[test]
+    fn a_url_request_may_omit_the_name() {
+        let r: CreateFromUrlRequest =
+            serde_json::from_str(r#"{"url":"https://example.com/a.mp3"}"#).unwrap();
+        assert_eq!(r.name, None);
+        // And the name is omitted from the wire when absent.
+        assert!(!serde_json::to_string(&r).unwrap().contains("name"));
+    }
+
+    #[test]
+    fn a_url_request_requires_a_url() {
+        assert!(serde_json::from_str::<CreateFromUrlRequest>(r#"{"name":"x"}"#).is_err());
+    }
     #[test]
     fn a_clean_request_needs_no_fields() {
         let r: CleanRequest = serde_json::from_str("{}").unwrap();
