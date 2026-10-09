@@ -26,7 +26,14 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_PAD_MS: u32 = 30;
 
 /// A transcribed word and the span of audio that produced it.
+///
+/// Unknown fields are rejected for the same reason [`crate::asr::TranscribeResponse`]
+/// rejects them: this is the shape the GPU service produces, and a field renamed
+/// on the Python side would otherwise arrive as a silent `None`. For
+/// `confidence` that would quietly disable the editor's highlighting with
+/// nothing to notice, which is worse than a failed request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Word {
     /// Position in the original transcript. Stable; it is how edits refer to
     /// this word for the life of the recording.
@@ -933,6 +940,15 @@ mod tests {
         let w: Word =
             serde_json::from_str(r#"{"index":0,"text":"hi","start_ms":0,"end_ms":100}"#).unwrap();
         assert_eq!(w.confidence, None);
+    }
+
+    #[test]
+    fn a_renamed_word_field_fails_rather_than_arriving_empty() {
+        // The whole point of denying unknown fields here: a Python-side typo in
+        // "confidence" would otherwise deserialise to None and silently turn
+        // off the editor's highlighting.
+        let json = r#"{"index":0,"text":"hi","start_ms":0,"end_ms":100,"confidense":0.9}"#;
+        assert!(serde_json::from_str::<Word>(json).is_err());
     }
 
     #[test]
