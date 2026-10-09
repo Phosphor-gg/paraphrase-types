@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::edit::{EditPlan, Judgement, Removal, Word};
+use crate::edit::{EditPlan, Removal, Word};
 
 /// Largest upload accepted, enforced on arriving bytes rather than on
 /// `Content-Length`, which a client controls.
@@ -185,14 +185,17 @@ pub struct CleanRequest {
     pub max_gap_ms: Option<u32>,
 }
 
-/// What the cleanup did, itemised so the editor can show why each word went.
+/// What the cleanup did, itemised so the editor can highlight every change.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CleanResponse {
     pub plan: EditPlan,
     pub removed: Vec<Removal>,
-    /// The ambiguous spans a judge ruled on, kept so the UI can explain a
-    /// decision the rules alone would not have made.
-    pub judgements: Vec<Judgement>,
+    /// Whether the edit plays any words out of their recorded order.
+    ///
+    /// Surfaced because a reorder is the one change worth previewing before
+    /// rendering: pitch and pace do not match across a spliced join, so it is
+    /// audibly worse than a deletion and a person should hear it first.
+    pub reordered: bool,
     pub edited_duration_ms: u32,
 }
 

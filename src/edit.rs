@@ -11,14 +11,19 @@
 //! that, reordering, and closing a long pause are all edits to one structure,
 //! which is why the "clean it up for me" button and hand-editing cannot drift
 //! apart.
+//!
+//! There are deliberately no rules about *which* words are worth cutting. An
+//! earlier version of this module carried lists of hesitation sounds and
+//! discourse markers and asked a model only to adjudicate the spans those lists
+//! found. That bounded the AI's recall by the lists: a rambling clause, a
+//! redundant restatement or a worthwhile reordering is on no list, so the model
+//! was never even asked. The model now decides everything, and
+//! [`bind_edit`] is what keeps that safe.
 
 use serde::{Deserialize, Serialize};
 
 /// Default padding kept either side of a word so a cut does not clip its edges.
 pub const DEFAULT_PAD_MS: u32 = 30;
-
-/// Longest repeated run `propose_fillers` will treat as a false start.
-const MAX_REPEATED_RUN: usize = 6;
 
 /// A transcribed word and the span of audio that produced it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,20 +115,16 @@ impl WordTrack {
     }
 }
 
-/// Why a word was dropped. Carried for the UI, never for correctness: the audio
-/// cut depends only on which indices survive.
+/// Who dropped a word.
+///
+/// There is nothing finer to record. The model is not asked to categorise its
+/// own reasoning, because a category it invents is unverifiable and the editor
+/// only needs to distinguish "the AI did this" from "you did this" so a person
+/// knows what to review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemovalReason {
-    /// A hesitation sound: um, uh, erm.
-    Hesitation,
-    /// An immediately repeated word or phrase, or a restarted sentence.
-    Repetition,
-    /// A discourse filler that carried no meaning here.
-    Filler,
-    /// The model judged this not worth keeping for another reason.
-    Model,
-    /// The person removed it by hand.
+    Ai,
     Manual,
 }
 
@@ -335,71 +336,12 @@ pub fn normalize(word: &str) -> String {
     word.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
 
-/// Sounds that are never content.
-const HESITATIONS: &[&str] = &[
-    "um", "umm", "ummm", "uh", "uhh", "uhhh", "er", "err", "erm", "ermm", "ah", "ahh", "eh",
-    "hmm", "hm", "mmm", "mm", "mhm", "uhhuh", "huh",
-];
 
-pub fn is_hesitation(word: &str) -> bool {
-    HESITATIONS.contains(&normalize(word).as_str())
-}
-
-/// A removal the AI or a rule proposed, with the reason for the UI.
+/// A word the edit dropped, and who dropped it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Removal {
     pub index: u32,
     pub reason: RemovalReason,
-}
-
-/// Deterministic cleanup: hesitation sounds, immediately repeated words, and
-/// restarted phrases.
-///
-/// This is the floor the product stands on with no model running at all, and it
-/// is what the LLM's output is diffed against when judging whether the model
-/// actually helped.
-pub fn propose_fillers(track: &WordTrack) -> Vec<Removal> {
-    let mut removals: Vec<Removal> = Vec::new();
-
-    // Hesitations first, so repetition detection sees "I I" in "I um I".
-    let mut surviving: Vec<u32> = Vec::with_capacity(track.len());
-    for w in &track.words {
-        if is_hesitation(&w.text) {
-            removals.push(Removal { index: w.index, reason: RemovalReason::Hesitation });
-        } else {
-            surviving.push(w.index);
-        }
-    }
-
-    // Then immediately repeated runs: "the the" and "I went to the I went to
-    // the store" both drop the earlier copy, keeping the completed attempt.
-    let norm: Vec<String> =
-        surviving.iter().filter_map(|&i| track.get(i)).map(|w| normalize(&w.text)).collect();
-
-    let mut i = 0usize;
-    while i < surviving.len() {
-        let mut matched = 0usize;
-        let max_k = MAX_REPEATED_RUN.min((surviving.len() - i) / 2);
-        for k in (1..=max_k).rev() {
-            if norm[i..i + k] == norm[i + k..i + 2 * k] && norm[i..i + k].iter().all(|w| !w.is_empty())
-            {
-                matched = k;
-                break;
-            }
-        }
-        if matched > 0 {
-            for &idx in &surviving[i..i + matched] {
-                removals.push(Removal { index: idx, reason: RemovalReason::Repetition });
-            }
-            i += matched;
-        } else {
-            i += 1;
-        }
-    }
-
-    removals.sort_by_key(|r| r.index);
-    removals.dedup_by_key(|r| r.index);
-    removals
 }
 
 /// Apply removals to a plan.
@@ -409,318 +351,149 @@ pub fn apply_removals(plan: &mut EditPlan, removals: &[Removal]) {
 }
 
 // ---------------------------------------------------------------------------
-// Turning a model's answer into a plan
+// Binding an edited transcript back onto the recording
 // ---------------------------------------------------------------------------
 
-/// One deletion the model asked for: the index, plus the word it believes is
-/// there.
+/// Why an edited transcript could not be bound to the recording.
 ///
-/// The echoed word is the whole point. A model that miscounts its way down a
-/// numbered list produces indices that are confidently wrong, and an index
-/// alone is unfalsifiable. Echoing the word makes an off-by-N self-evident.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProposedDeletion {
-    pub index: u32,
-    pub word: String,
-    #[serde(default)]
-    pub reason: Option<RemovalReason>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeletionProposal {
-    pub deletions: Vec<ProposedDeletion>,
-}
-
+/// Both variants mean the same thing in practice: the model rewrote instead of
+/// editing. They are separate because the distinction tells you *how* it went
+/// wrong, which is worth knowing when a prompt needs changing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
-pub enum ProposalError {
-    /// The index is not a word in this recording.
-    IndexOutOfRange { index: u32, len: usize },
-    /// The model's own echo disagrees with the word at that index, so its
-    /// counting has drifted and none of its indices can be trusted.
-    WordMismatch { index: u32, expected: String, got: String },
-    /// Everything was deleted. Always a bug, never an edit worth rendering.
-    DeletesEverything,
-}
-
-impl std::fmt::Display for ProposalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::IndexOutOfRange { index, len } => {
-                write!(f, "word {index} is outside this recording's {len} words")
-            }
-            Self::WordMismatch { index, expected, got } => write!(
-                f,
-                "word {index} is {expected:?} but the model called it {got:?}"
-            ),
-            Self::DeletesEverything => write!(f, "the proposal removes every word"),
-        }
-    }
-}
-
-impl std::error::Error for ProposalError {}
-
-impl DeletionProposal {
-    /// Check every deletion against the track and turn the proposal into
-    /// removals.
+pub enum BindError {
+    /// A word that does not occur in this passage at all.
+    NotSpoken { word: String },
+    /// A word used more times than it was spoken.
     ///
-    /// Rejects the whole proposal on the first disagreement rather than
-    /// dropping the bad entry: a model whose indices have drifted is wrong
-    /// everywhere after the drift, and partially applying that cuts audio at
-    /// random.
-    pub fn validate(&self, track: &WordTrack) -> Result<Vec<Removal>, ProposalError> {
-        let mut removals = Vec::with_capacity(self.deletions.len());
-        for d in &self.deletions {
-            let word = track.get(d.index).ok_or(ProposalError::IndexOutOfRange {
-                index: d.index,
-                len: track.len(),
-            })?;
-            if normalize(&word.text) != normalize(&d.word) {
-                return Err(ProposalError::WordMismatch {
-                    index: d.index,
-                    expected: word.text.clone(),
-                    got: d.word.clone(),
-                });
-            }
-            removals.push(Removal {
-                index: d.index,
-                reason: d.reason.unwrap_or(RemovalReason::Model),
-            });
-        }
-        removals.sort_by_key(|r| r.index);
-        removals.dedup_by_key(|r| r.index);
-
-        if !track.is_empty() && removals.len() == track.len() {
-            return Err(ProposalError::DeletesEverything);
-        }
-        Ok(removals)
-    }
+    /// Its own variant because it is the signature of a model duplicating a
+    /// phrase rather than inventing vocabulary, and there is only one piece of
+    /// audio per occurrence to cut.
+    UsedMoreOftenThanSpoken { word: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum AlignError {
-    /// A word in the cleaned text is not available in the remaining original
-    /// words. Either the model invented it or it reordered, and neither can be
-    /// turned into an audio cut.
-    UnmatchedWord { word: String, after_index: usize },
-}
-
-impl std::fmt::Display for AlignError {
+impl std::fmt::Display for BindError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnmatchedWord { word, after_index } => write!(
-                f,
-                "{word:?} does not occur in the recording after word {after_index}; \
-                 the model invented or moved it"
-            ),
+            Self::NotSpoken { word } => {
+                write!(f, "{word:?} was never spoken in this passage")
+            }
+            Self::UsedMoreOftenThanSpoken { word } => {
+                write!(f, "{word:?} is used more often than it was spoken")
+            }
         }
     }
 }
 
-impl std::error::Error for AlignError {}
+impl std::error::Error for BindError {}
 
-/// Align cleaned free text back onto the original words, keeping only a
-/// subsequence.
+/// Bind an edited passage back onto the words that were actually spoken.
 ///
-/// This exists for models that will not reliably emit indices, and it is strict
-/// on purpose: an output word with no match left in the original is an error,
-/// not a deletion. Treating it as a deletion is how a rephrase silently becomes
-/// a cut of real speech.
-pub fn plan_from_cleaned_text(track: &WordTrack, cleaned: &str) -> Result<Vec<u32>, AlignError> {
+/// This is the whole safety mechanism, and it is why the model needs no rules
+/// and no restrictions on what it may cut or move. Every word of the edited text
+/// must claim one not-yet-claimed original word; the result is the sequence of
+/// original indices those claims landed on. Deleting is a word left unclaimed
+/// and reordering is claims made out of order, so both are free — while a word
+/// nobody said has nothing to claim and is rejected.
+///
+/// Rejecting is the point. The earlier Python prototype of this feature aligned
+/// the model's text with a diff and cut everything the diff called changed, so a
+/// rephrase silently became a cut of real speech and nobody could tell. An
+/// unbindable word is an error here, never a deletion.
+///
+/// Returned indices are absolute, taken from each [`Word::index`], so a window
+/// into the middle of a recording needs no offset arithmetic at the call site.
+pub fn bind_edit(window: &[Word], edited: &str) -> Result<Vec<u32>, BindError> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut available: HashMap<String, VecDeque<usize>> = HashMap::new();
+    for (position, word) in window.iter().enumerate() {
+        let normalised = normalize(&word.text);
+        if normalised.is_empty() {
+            continue;
+        }
+        available.entry(normalised).or_default().push_back(position);
+    }
+
     let mut kept = Vec::new();
     let mut cursor = 0usize;
 
-    for token in cleaned.split_whitespace() {
+    for token in edited.split_whitespace() {
         let want = normalize(token);
+        // Punctuation-only tokens carry no audio, so they bind to nothing and
+        // are not an error either.
         if want.is_empty() {
             continue;
         }
-        let found = (cursor..track.len()).find(|&j| normalize(&track.words[j].text) == want);
-        match found {
-            Some(j) => {
-                kept.push(track.words[j].index);
-                cursor = j + 1;
-            }
-            None => {
-                return Err(AlignError::UnmatchedWord {
-                    word: token.to_string(),
-                    after_index: cursor,
-                })
-            }
+        let Some(slots) = available.get_mut(&want) else {
+            return Err(BindError::NotSpoken { word: token.to_string() });
+        };
+        if slots.is_empty() {
+            return Err(BindError::UsedMoreOftenThanSpoken { word: token.to_string() });
         }
+        // The nearest unclaimed occurrence at or after the cursor, falling back
+        // to the earliest remaining one. Preferring forwards means an unchanged
+        // passage binds to itself, so the common case stays in recorded order
+        // and only a genuine move produces a backwards jump.
+        let choice = slots.iter().position(|&p| p >= cursor).unwrap_or(0);
+        let position = slots.remove(choice).expect("position() returned a valid index");
+        kept.push(window[position].index);
+        cursor = position + 1;
     }
+
     Ok(kept)
 }
 
-/// Render the numbered word list a model is asked to choose deletions from.
+/// Whether a kept sequence plays words out of their recorded order.
 ///
-/// Every word carries its own index so the model copies a number instead of
-/// counting to one, which is the difference between an occasional off-by-one and
-/// a systematic drift.
-pub fn numbered_words(track: &WordTrack) -> String {
-    track
-        .words
-        .iter()
-        .map(|w| format!("{}:{}", w.index, w.text))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Worth knowing before rendering: splicing non-adjacent spans out of
+/// chronological order is audibly worse than deleting between them, because
+/// pitch and pace do not match across the join and no crossfade hides it.
+pub fn is_reordered(kept: &[u32]) -> bool {
+    kept.windows(2).any(|w| w[0] >= w[1])
 }
 
-// ---------------------------------------------------------------------------
-// Candidates: what the rules suspect but cannot decide alone
-// ---------------------------------------------------------------------------
-
-/// Discourse markers whose filler-ness depends entirely on context.
+/// Split a track into windows to edit separately.
 ///
-/// "it tastes *like* chicken" is a comparison and "by *like* Friday" is a tic,
-/// and no rule distinguishes them. These are proposed, never removed outright.
-const AMBIGUOUS_WORDS: &[&str] = &[
-    "like", "basically", "actually", "literally", "really", "just", "so", "well",
-    "right", "okay", "anyway", "obviously", "honestly", "totally", "essentially",
-];
-
-/// Multi-word markers, matched over surviving words so a hesitation between the
-/// halves does not hide them.
-const AMBIGUOUS_PHRASES: &[&[&str]] = &[
-    &["you", "know"],
-    &["i", "mean"],
-    &["sort", "of"],
-    &["kind", "of"],
-    &["you", "see"],
-    &["or", "something"],
-    &["or", "whatever"],
-];
-
-/// Words that make a following "you know" or "you see" a real question rather
-/// than a tic: "do you know", "would you see".
+/// A whole recording in one prompt degrades the model's attention to any
+/// particular sentence, and a megabyte of transcript is slow besides. Windows
+/// are also independent, so they can be edited concurrently.
 ///
-/// A grammatical signal is worth more than a prompt instruction here. A judge
-/// was measured turning "do you know what time it is" into "do what time it is"
-/// even with the contrasting case in its examples, so the span is not proposed
-/// at all rather than proposed and hopefully declined. Apostrophes are already
-/// stripped by [`normalize`], so "don't" arrives as "dont".
-const INTERROGATIVE_LEADS: &[&str] = &[
-    "do", "dont", "did", "didnt", "does", "doesnt", "would", "wouldnt", "will", "wont",
-    "can", "cant", "could", "couldnt", "should", "shouldnt", "if", "whether", "unless",
-];
-
-/// A span the rules suspect is filler but will not remove without a judgement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Candidate {
-    /// Original word indices, ascending.
-    pub indices: Vec<u32>,
-    /// The words themselves, for the prompt and for the UI.
-    pub text: String,
-}
-
-/// A judgement on one candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Verdict {
-    /// Removing it leaves the meaning identical.
-    Filler,
-    /// It carries meaning, or the sentence breaks without it.
-    Content,
-}
-
-/// What a judge is asked about one candidate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Judgement {
-    pub candidate: Candidate,
-    pub verdict: Verdict,
-}
-
-/// Spans worth asking about, skipping anything already removed.
-///
-/// The indices come from here rather than from a model, which is what makes
-/// index drift unrepresentable: a judge only ever answers "filler" or "content"
-/// about a span this function chose.
-pub fn candidate_spans(track: &WordTrack, removed: &[u32]) -> Vec<Candidate> {
-    let gone: std::collections::HashSet<u32> = removed.iter().copied().collect();
-    let surviving: Vec<u32> =
-        (0..track.len() as u32).filter(|i| !gone.contains(i)).collect();
-    let norm: Vec<String> = surviving
-        .iter()
-        .filter_map(|&i| track.get(i))
-        .map(|w| normalize(&w.text))
-        .collect();
-
+/// Boundaries prefer the end of a sentence in the last quarter of the window,
+/// because a cut landing mid-clause removes the context needed to judge the
+/// words either side of it. Reordering cannot cross a window boundary, which is
+/// an accepted limit: moving a clause between distant parts of a recording is
+/// not something this feature promises.
+pub fn chunk_ranges(track: &WordTrack, target_words: usize) -> Vec<(usize, usize)> {
+    if track.is_empty() {
+        return Vec::new();
+    }
+    let target = target_words.max(1);
     let mut out = Vec::new();
-    let mut at = 0usize;
-    while at < surviving.len() {
-        // Longest phrase first, so "kind of" is not proposed as a bare "kind".
-        let phrase = AMBIGUOUS_PHRASES.iter().find(|p| {
-            at + p.len() <= surviving.len()
-                && norm[at..at + p.len()].iter().zip(p.iter()).all(|(a, b)| a == b)
-        });
-        if let Some(p) = phrase {
-            // "do you know ..." is a question; only a bare "you know" is a tic.
-            let interrogative = p.first() == Some(&"you")
-                && at > 0
-                && INTERROGATIVE_LEADS.contains(&norm[at - 1].as_str());
-            if !interrogative {
-                let indices: Vec<u32> = surviving[at..at + p.len()].to_vec();
-                out.push(Candidate { text: words_text(track, &indices), indices });
+    let mut start = 0usize;
+
+    while start < track.len() {
+        let limit = (start + target).min(track.len());
+        if limit == track.len() {
+            out.push((start, limit));
+            break;
+        }
+        let earliest = start + (target * 3 / 4).max(1);
+        let mut end = limit;
+        for position in (earliest..limit).rev() {
+            if ends_sentence(&track.words[position].text) {
+                end = position + 1;
+                break;
             }
-            at += p.len();
-            continue;
         }
-        if AMBIGUOUS_WORDS.contains(&norm[at].as_str()) {
-            let indices = vec![surviving[at]];
-            out.push(Candidate { text: words_text(track, &indices), indices });
-        }
-        at += 1;
+        out.push((start, end));
+        start = end;
     }
     out
 }
 
-fn words_text(track: &WordTrack, indices: &[u32]) -> String {
-    indices
-        .iter()
-        .filter_map(|&i| track.get(i))
-        .map(|w| w.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// The sentence as it currently stands, with the candidate marked.
-///
-/// Words already removed are hidden, so the judge reads the text the listener
-/// would actually hear rather than the raw transcript.
-pub fn judge_context(track: &WordTrack, removed: &[u32], candidate: &Candidate) -> String {
-    let gone: std::collections::HashSet<u32> = removed.iter().copied().collect();
-    let span: std::collections::HashSet<u32> = candidate.indices.iter().copied().collect();
-    let first = candidate.indices.first().copied();
-
-    let mut parts: Vec<String> = Vec::new();
-    for w in &track.words {
-        if Some(w.index) == first {
-            parts.push(format!("<<{}>>", candidate.text));
-        } else if span.contains(&w.index) || gone.contains(&w.index) {
-            continue;
-        } else {
-            parts.push(w.text.clone());
-        }
-    }
-    parts.join(" ")
-}
-
-/// Turn judgements into removals, keeping only the filler verdicts.
-pub fn removals_from_judgements(judged: &[Judgement]) -> Vec<Removal> {
-    let mut out: Vec<Removal> = judged
-        .iter()
-        .filter(|j| j.verdict == Verdict::Filler)
-        .flat_map(|j| {
-            j.candidate
-                .indices
-                .iter()
-                .map(|&index| Removal { index, reason: RemovalReason::Filler })
-        })
-        .collect();
-    out.sort_by_key(|r| r.index);
-    out.dedup_by_key(|r| r.index);
-    out
+fn ends_sentence(text: &str) -> bool {
+    matches!(text.trim_end().chars().last(), Some('.') | Some('!') | Some('?'))
 }
 
 #[cfg(test)]
@@ -731,282 +504,220 @@ mod tests {
         WordTrack::from_text(text, 100)
     }
 
+    fn spoken(track: &WordTrack) -> Vec<String> {
+        track.words.iter().map(|w| normalize(&w.text)).collect()
+    }
+
     // -- the load-bearing invariant -----------------------------------------
 
     #[test]
-    fn edited_text_never_contains_a_word_that_was_not_spoken() {
-        let t = track("um so I basically went to the uh the store yesterday");
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &propose_fillers(&t));
-
-        let spoken: Vec<String> = t.words.iter().map(|w| normalize(&w.text)).collect();
-        for word in plan.text(&t).split_whitespace() {
-            assert!(
-                spoken.contains(&normalize(word)),
-                "{word:?} is not in the recording"
-            );
-        }
-    }
-
-    #[test]
-    fn every_kept_word_is_backed_by_exactly_one_original_word() {
-        let t = track("one two three four five");
-        let mut plan = EditPlan::unedited(&t);
-        plan.remove(2);
+    fn a_bound_edit_can_only_contain_words_that_were_spoken() {
+        let t = track("um so I basically went to the store yesterday");
+        let kept = bind_edit(&t.words, "I went to the store yesterday").unwrap();
+        let plan = EditPlan { kept, max_gap_ms: None, pad_ms: 30 };
         plan.validate(&t).unwrap();
-
-        // Audio can only be reused once, so a duplicate is a hard error.
-        plan.kept.push(1);
-        assert_eq!(plan.validate(&t), Err(EditError::DuplicateWord { index: 1 }));
-    }
-
-    #[test]
-    fn a_plan_cannot_reference_a_word_outside_the_recording() {
-        let t = track("one two three");
-        let plan = EditPlan { kept: vec![0, 7], max_gap_ms: None, pad_ms: 0 };
-        assert_eq!(
-            plan.validate(&t),
-            Err(EditError::IndexOutOfRange { index: 7, len: 3 })
-        );
-    }
-
-    // -- deterministic cleanup ----------------------------------------------
-
-    #[test]
-    fn hesitations_are_removed() {
-        let t = track("um I uh went er to the store");
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &propose_fillers(&t));
-        assert_eq!(plan.text(&t), "I went to the store");
-    }
-
-    #[test]
-    fn hesitations_are_matched_despite_punctuation_and_case() {
-        let t = track("Um, I went. Uh... to the store");
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &propose_fillers(&t));
-        assert_eq!(plan.text(&t), "I went. to the store");
-    }
-
-    #[test]
-    fn an_immediately_repeated_word_keeps_one_copy() {
-        let t = track("I went to the the store");
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &propose_fillers(&t));
-        assert_eq!(plan.text(&t), "I went to the store");
-    }
-
-    #[test]
-    fn a_restarted_phrase_keeps_the_completed_attempt() {
-        let t = track("I went to the I went to the store");
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &propose_fillers(&t));
-        assert_eq!(plan.text(&t), "I went to the store");
-        // It kept the second attempt, not the abandoned one.
-        assert_eq!(plan.kept, vec![4, 5, 6, 7, 8]);
-    }
-
-    #[test]
-    fn a_hesitation_between_two_copies_does_not_hide_the_repetition() {
-        let t = track("I I um went to the store");
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &propose_fillers(&t));
-        assert_eq!(plan.text(&t), "I went to the store");
-    }
-
-    #[test]
-    fn clean_speech_is_left_alone() {
-        let t = track("The quick brown fox jumps over the lazy dog");
-        let removals = propose_fillers(&t);
-        assert!(removals.is_empty(), "{removals:?}");
-    }
-
-    #[test]
-    fn a_legitimately_repeated_word_across_a_phrase_is_not_a_stutter() {
-        // "the" twice, but not adjacent, so nothing is a repetition.
-        let t = track("the cat sat on the mat");
-        assert!(propose_fillers(&t).is_empty());
-    }
-
-    #[test]
-    fn cleanup_is_idempotent() {
-        let t = track("um I I went to the uh store");
-        let mut once = EditPlan::unedited(&t);
-        apply_removals(&mut once, &propose_fillers(&t));
-
-        // Re-running over the surviving words must change nothing further.
-        let survivors = WordTrack::new(
-            once.kept.iter().filter_map(|&i| t.get(i)).cloned(),
-        );
-        assert!(
-            propose_fillers(&survivors).is_empty(),
-            "second pass still wanted to cut {:?}",
-            propose_fillers(&survivors)
-        );
-    }
-
-    #[test]
-    fn content_words_numbers_and_names_survive() {
-        let t = track("um so Jaiden spent 42 pounds uh on the thing");
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &propose_fillers(&t));
-        let out = plan.text(&t);
-        for must in ["Jaiden", "42", "pounds"] {
-            assert!(out.contains(must), "{must:?} was lost from {out:?}");
+        for word in plan.text(&t).split_whitespace() {
+            assert!(spoken(&t).contains(&normalize(word)), "{word:?} was not spoken");
         }
     }
 
     #[test]
-    fn an_empty_recording_is_handled() {
-        let t = track("");
-        assert!(propose_fillers(&t).is_empty());
-        let plan = EditPlan::unedited(&t);
-        assert_eq!(plan.text(&t), "");
-        assert_eq!(plan.keep_intervals(&t), vec![]);
-        assert!(plan.is_unedited(&t));
-    }
-
-    // -- model proposals ----------------------------------------------------
-
-    #[test]
-    fn a_proposal_whose_words_agree_is_accepted() {
+    fn an_invented_word_is_rejected_rather_than_cut() {
+        // The failure that made the earlier prototype unusable: the model
+        // rewrites, and the rewrite is charged to the audio as a deletion.
         let t = track("um I went to the store");
-        let proposal = DeletionProposal {
-            deletions: vec![ProposedDeletion {
-                index: 0,
-                word: "um".into(),
-                reason: Some(RemovalReason::Hesitation),
-            }],
-        };
-        let removals = proposal.validate(&t).unwrap();
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &removals);
-        assert_eq!(plan.text(&t), "I went to the store");
-    }
-
-    #[test]
-    fn a_drifted_index_is_rejected_rather_than_cutting_the_wrong_word() {
-        let t = track("um I went to the store");
-        // The model meant "um" but counted from one.
-        let proposal = DeletionProposal {
-            deletions: vec![ProposedDeletion { index: 1, word: "um".into(), reason: None }],
-        };
         assert_eq!(
-            proposal.validate(&t),
-            Err(ProposalError::WordMismatch {
-                index: 1,
-                expected: "I".into(),
-                got: "um".into()
-            })
+            bind_edit(&t.words, "I subsequently went to the store"),
+            Err(BindError::NotSpoken { word: "subsequently".into() })
         );
-    }
-
-    #[test]
-    fn one_bad_entry_rejects_the_whole_proposal() {
-        let t = track("um I went to the store");
-        let proposal = DeletionProposal {
-            deletions: vec![
-                ProposedDeletion { index: 0, word: "um".into(), reason: None },
-                ProposedDeletion { index: 3, word: "the".into(), reason: None },
-            ],
-        };
-        // Index 3 is "to", not "the". Nothing is applied, because after a drift
-        // the earlier indices cannot be trusted either.
-        assert!(proposal.validate(&t).is_err());
-    }
-
-    #[test]
-    fn a_proposal_cannot_invent_a_word() {
-        let t = track("I went to the store");
-        // There is no index that holds a word nobody said, so the only way to
-        // express this is an out-of-range index.
-        let proposal = DeletionProposal {
-            deletions: vec![ProposedDeletion { index: 99, word: "furthermore".into(), reason: None }],
-        };
-        assert_eq!(
-            proposal.validate(&t),
-            Err(ProposalError::IndexOutOfRange { index: 99, len: 5 })
-        );
-    }
-
-    #[test]
-    fn deleting_everything_is_rejected() {
-        let t = track("um uh er");
-        let proposal = DeletionProposal {
-            deletions: vec![
-                ProposedDeletion { index: 0, word: "um".into(), reason: None },
-                ProposedDeletion { index: 1, word: "uh".into(), reason: None },
-                ProposedDeletion { index: 2, word: "er".into(), reason: None },
-            ],
-        };
-        assert_eq!(proposal.validate(&t), Err(ProposalError::DeletesEverything));
-    }
-
-    #[test]
-    fn repeated_deletions_of_the_same_word_collapse() {
-        let t = track("um I went");
-        let proposal = DeletionProposal {
-            deletions: vec![
-                ProposedDeletion { index: 0, word: "um".into(), reason: None },
-                ProposedDeletion { index: 0, word: "um".into(), reason: None },
-            ],
-        };
-        assert_eq!(proposal.validate(&t).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn numbered_words_pairs_every_word_with_its_index() {
-        let t = track("um I went");
-        assert_eq!(numbered_words(&t), "0:um 1:I 2:went");
-    }
-
-    // -- free-text alignment ------------------------------------------------
-
-    #[test]
-    fn cleaned_text_that_only_deletes_aligns() {
-        let t = track("um so I went to the store");
-        let kept = plan_from_cleaned_text(&t, "I went to the store").unwrap();
-        assert_eq!(kept, vec![2, 3, 4, 5, 6]);
-    }
-
-    #[test]
-    fn alignment_tolerates_the_model_repunctuating() {
-        let t = track("um I went to the store");
-        let kept = plan_from_cleaned_text(&t, "I went to the store.").unwrap();
-        assert_eq!(kept, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn an_invented_word_is_an_error_not_a_deletion() {
-        let t = track("um I went to the store");
-        // This is the failure that made the earlier prototype unusable: the
-        // model rewrote rather than cut, and the rewrite was charged to the
-        // audio as a deletion.
-        let err = plan_from_cleaned_text(&t, "I subsequently went to the store").unwrap_err();
-        assert!(matches!(err, AlignError::UnmatchedWord { ref word, .. } if word == "subsequently"));
     }
 
     #[test]
     fn a_wholesale_rephrase_is_rejected() {
         let t = track("um so I kind of went to the store yesterday");
-        assert!(plan_from_cleaned_text(&t, "I visited the shop").is_err());
+        assert!(bind_edit(&t.words, "I visited the shop").is_err());
     }
 
     #[test]
-    fn reordering_is_rejected_on_the_text_path() {
+    fn a_word_cannot_be_used_more_often_than_it_was_spoken() {
+        // There is one piece of audio per occurrence.
         let t = track("I went to the store");
-        // Expressible by hand via move_word, but not inferable from free text.
-        assert!(plan_from_cleaned_text(&t, "to the store I went").is_err());
+        assert_eq!(
+            bind_edit(&t.words, "I went to the the store"),
+            Err(BindError::UsedMoreOftenThanSpoken { word: "the".into() })
+        );
     }
 
     #[test]
-    fn aligned_text_is_always_a_subsequence() {
-        let t = track("um so I basically went to the uh store");
-        let kept = plan_from_cleaned_text(&t, "so I went to the store").unwrap();
-        assert!(kept.windows(2).all(|w| w[0] < w[1]), "{kept:?} is not ascending");
+    fn a_duplicated_phrase_is_rejected() {
+        let t = track("we should ship it");
+        assert!(matches!(
+            bind_edit(&t.words, "we should ship it we should ship it"),
+            Err(BindError::UsedMoreOftenThanSpoken { .. })
+        ));
     }
 
-    // -- manual editing -----------------------------------------------------
+    #[test]
+    fn every_bind_error_names_the_offending_word() {
+        for e in [
+            BindError::NotSpoken { word: "furthermore".into() },
+            BindError::UsedMoreOftenThanSpoken { word: "the".into() },
+        ] {
+            let m = e.to_string();
+            assert!(m.contains('"'), "{m:?} should quote the word");
+        }
+    }
+
+    // -- what the model is free to do ---------------------------------------
+
+    #[test]
+    fn an_unchanged_passage_binds_to_itself() {
+        let t = track("the quick brown fox jumps over the lazy dog");
+        let kept = bind_edit(&t.words, "the quick brown fox jumps over the lazy dog").unwrap();
+        assert_eq!(kept, (0..9).collect::<Vec<u32>>());
+        assert!(!is_reordered(&kept));
+    }
+
+    #[test]
+    fn deleting_anything_is_free_with_no_rule_saying_what() {
+        // A rambling clause is on no filler list, and that is the point: the
+        // model may cut it and the binding does not care why.
+        let t = track("the point is and I should say this first that it works");
+        let kept = bind_edit(&t.words, "the point is that it works").unwrap();
+        let plan = EditPlan { kept, max_gap_ms: None, pad_ms: 0 };
+        assert_eq!(plan.text(&t), "the point is that it works");
+    }
+
+    #[test]
+    fn reordering_is_allowed() {
+        let t = track("world hello");
+        let kept = bind_edit(&t.words, "hello world").unwrap();
+        assert_eq!(kept, vec![1, 0]);
+        assert!(is_reordered(&kept));
+    }
+
+    #[test]
+    fn a_clause_can_be_moved() {
+        let t = track("because it was raining we stayed in");
+        let kept = bind_edit(&t.words, "we stayed in because it was raining").unwrap();
+        assert_eq!(kept, vec![4, 5, 6, 0, 1, 2, 3]);
+        assert!(is_reordered(&kept));
+        let plan = EditPlan { kept, max_gap_ms: None, pad_ms: 0 };
+        plan.validate(&t).unwrap();
+    }
+
+    #[test]
+    fn repunctuation_and_case_do_not_break_the_binding() {
+        let t = track("um i went to the store");
+        let kept = bind_edit(&t.words, "I went to the store.").unwrap();
+        assert_eq!(kept, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_punctuation_only_token_binds_to_nothing_and_is_not_an_error() {
+        let t = track("hello there");
+        assert_eq!(bind_edit(&t.words, "hello , there").unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_repeated_word_binds_to_the_nearest_unclaimed_occurrence() {
+        // "the" occurs twice; an unchanged passage must stay in order rather
+        // than binding the second mention to the first occurrence.
+        let t = track("the cat sat on the mat");
+        let kept = bind_edit(&t.words, "the cat sat on the mat").unwrap();
+        assert_eq!(kept, vec![0, 1, 2, 3, 4, 5]);
+        assert!(!is_reordered(&kept));
+    }
+
+    #[test]
+    fn a_kept_stutter_binds_forwards_not_backwards() {
+        let t = track("I I went");
+        let kept = bind_edit(&t.words, "I went").unwrap();
+        // Either "I" is defensible, but it must not then report a reorder.
+        assert_eq!(kept.len(), 2);
+        assert!(!is_reordered(&kept), "{kept:?}");
+    }
+
+    #[test]
+    fn an_empty_edit_binds_to_nothing() {
+        // Legitimate for a window that held only filler; a whole recording
+        // reduced to nothing is caught by the caller, not here.
+        let t = track("um uh er");
+        assert_eq!(bind_edit(&t.words, "").unwrap(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_window_returns_absolute_indices() {
+        // So a window into the middle of a recording needs no offset
+        // arithmetic at the call site, which is where an off-by-one would cut
+        // the wrong audio.
+        let t = track("zero one two three four five");
+        let kept = bind_edit(&t.words[3..], "three five").unwrap();
+        assert_eq!(kept, vec![3, 5]);
+    }
+
+    // -- windows ------------------------------------------------------------
+
+    #[test]
+    fn a_short_track_is_one_window() {
+        let t = track("one two three");
+        assert_eq!(chunk_ranges(&t, 100), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn an_empty_track_has_no_windows() {
+        assert!(chunk_ranges(&track(""), 50).is_empty());
+    }
+
+    #[test]
+    fn windows_prefer_to_end_on_a_sentence() {
+        //                        0  1   2    3     4  5    6    7
+        let t = track("one two three end. four five six seven");
+        let ranges = chunk_ranges(&t, 5);
+        assert_eq!(ranges[0], (0, 4), "should break after \"end.\"");
+        assert_eq!(ranges.last().unwrap().1, t.len());
+    }
+
+    #[test]
+    fn a_window_falls_back_to_the_hard_limit_without_a_sentence_end() {
+        let t = track("one two three four five six seven eight");
+        let ranges = chunk_ranges(&t, 4);
+        assert_eq!(ranges, vec![(0, 4), (4, 8)]);
+    }
+
+    #[test]
+    fn windows_cover_every_word_exactly_once() {
+        let t = track(
+            "a b c d. e f g h. i j k l m n o p q r. s t u v w x y z",
+        );
+        for target in [1, 2, 3, 5, 8, 13] {
+            let ranges = chunk_ranges(&t, target);
+            assert_eq!(ranges.first().unwrap().0, 0, "target {target}");
+            assert_eq!(ranges.last().unwrap().1, t.len(), "target {target}");
+            for pair in ranges.windows(2) {
+                assert_eq!(pair[0].1, pair[1].0, "gap or overlap at target {target}");
+            }
+            assert!(ranges.iter().all(|(a, b)| a < b), "empty window at {target}");
+        }
+    }
+
+    #[test]
+    fn a_zero_target_does_not_loop_forever() {
+        let t = track("one two three");
+        let ranges = chunk_ranges(&t, 0);
+        assert_eq!(ranges.last().unwrap().1, t.len());
+    }
+
+    // -- plans --------------------------------------------------------------
+
+    #[test]
+    fn the_unedited_plan_changes_nothing() {
+        let t = track("one two three");
+        let plan = EditPlan::unedited(&t);
+        assert!(plan.is_unedited(&t));
+        assert_eq!(plan.text(&t), "one two three");
+        assert!(plan.removed(&t).is_empty());
+    }
 
     #[test]
     fn removing_and_restoring_returns_the_original() {
@@ -1015,7 +726,6 @@ mod tests {
         plan.remove(2);
         assert_eq!(plan.text(&t), "one two four");
         plan.restore(2);
-        assert_eq!(plan.text(&t), "one two three four");
         assert!(plan.is_unedited(&t));
     }
 
@@ -1047,15 +757,6 @@ mod tests {
     }
 
     #[test]
-    fn reordering_still_cannot_introduce_a_word() {
-        let t = track("world hello");
-        let mut plan = EditPlan::unedited(&t);
-        plan.move_word(1, 0).unwrap();
-        let spoken: Vec<String> = t.words.iter().map(|w| normalize(&w.text)).collect();
-        assert!(plan.text(&t).split_whitespace().all(|w| spoken.contains(&normalize(w))));
-    }
-
-    #[test]
     fn moving_outside_the_kept_words_is_an_error() {
         let t = track("one two");
         let mut plan = EditPlan::unedited(&t);
@@ -1063,12 +764,41 @@ mod tests {
     }
 
     #[test]
-    fn removed_lists_what_the_edit_dropped() {
+    fn a_word_kept_twice_is_refused_because_its_audio_exists_once() {
+        let t = track("one two three");
+        let mut plan = EditPlan::unedited(&t);
+        plan.kept.push(1);
+        assert_eq!(plan.validate(&t), Err(EditError::DuplicateWord { index: 1 }));
+    }
+
+    #[test]
+    fn a_plan_cannot_reference_a_word_outside_the_recording() {
+        let t = track("one two three");
+        let plan = EditPlan { kept: vec![0, 7], max_gap_ms: None, pad_ms: 0 };
+        assert_eq!(plan.validate(&t), Err(EditError::IndexOutOfRange { index: 7, len: 3 }));
+    }
+
+    #[test]
+    fn applying_removals_drops_exactly_those_words() {
         let t = track("one two three four");
         let mut plan = EditPlan::unedited(&t);
-        plan.remove(1);
-        plan.remove(3);
-        assert_eq!(plan.removed(&t), vec![1, 3]);
+        apply_removals(
+            &mut plan,
+            &[
+                Removal { index: 1, reason: RemovalReason::Ai },
+                Removal { index: 3, reason: RemovalReason::Manual },
+            ],
+        );
+        assert_eq!(plan.text(&t), "one three");
+    }
+
+    #[test]
+    fn an_empty_recording_is_handled() {
+        let t = track("");
+        let plan = EditPlan::unedited(&t);
+        assert_eq!(plan.text(&t), "");
+        assert_eq!(plan.keep_intervals(&t), vec![]);
+        assert!(plan.is_unedited(&t));
     }
 
     // -- audio spans --------------------------------------------------------
@@ -1081,10 +811,7 @@ mod tests {
             Word::new(2, "three", 200, 300),
         ]);
         let plan = EditPlan { kept: vec![0, 1, 2], max_gap_ms: None, pad_ms: 0 };
-        assert_eq!(
-            plan.keep_intervals(&t),
-            vec![Interval { start_ms: 0, end_ms: 300 }]
-        );
+        assert_eq!(plan.keep_intervals(&t), vec![Interval { start_ms: 0, end_ms: 300 }]);
     }
 
     #[test]
@@ -1106,8 +833,6 @@ mod tests {
 
     #[test]
     fn padding_never_reaches_into_a_neighbouring_word() {
-        // 40ms of silence between each word; a 30ms pad must clamp to 20ms so
-        // it cannot pick up the tail of the removed word.
         let t = WordTrack::new(vec![
             Word::new(0, "one", 0, 100),
             Word::new(1, "um", 140, 240),
@@ -1117,9 +842,7 @@ mod tests {
         let spans = plan.keep_intervals(&t);
         assert_eq!(spans[0].end_ms, 120, "bled into the silence before \"um\"");
         assert_eq!(spans[1].start_ms, 260, "bled into the silence after \"um\"");
-        // And neither span touches the removed word's own audio.
-        assert!(spans[0].end_ms <= 140);
-        assert!(spans[1].start_ms >= 240);
+        assert!(spans[0].end_ms <= 140 && spans[1].start_ms >= 240);
     }
 
     #[test]
@@ -1143,7 +866,6 @@ mod tests {
 
     #[test]
     fn a_long_pause_is_trimmed_to_the_gap_limit() {
-        // Two kept, adjacent words with two seconds of dead air between them.
         let t = WordTrack::new(vec![
             Word::new(0, "one", 0, 100),
             Word::new(1, "two", 2100, 2200),
@@ -1151,8 +873,7 @@ mod tests {
         let plan = EditPlan { kept: vec![0, 1], max_gap_ms: Some(200), pad_ms: 0 };
         let spans = plan.keep_intervals(&t);
         assert_eq!(spans.len(), 2, "the pause should split the span");
-        let silence_kept = (spans[0].end_ms - 100) + (2100 - spans[1].start_ms);
-        assert_eq!(silence_kept, 200);
+        assert_eq!((spans[0].end_ms - 100) + (2100 - spans[1].start_ms), 200);
         assert_eq!(plan.output_duration_ms(&t), 400);
     }
 
@@ -1163,11 +884,7 @@ mod tests {
             Word::new(1, "two", 180, 280),
         ]);
         let plan = EditPlan { kept: vec![0, 1], max_gap_ms: Some(200), pad_ms: 0 };
-        assert_eq!(
-            plan.keep_intervals(&t),
-            vec![Interval { start_ms: 0, end_ms: 280 }],
-            "an 80ms pause is under the limit and needs no cut"
-        );
+        assert_eq!(plan.keep_intervals(&t), vec![Interval { start_ms: 0, end_ms: 280 }]);
     }
 
     #[test]
@@ -1186,179 +903,14 @@ mod tests {
         );
     }
 
-    // -- candidates and judgements ------------------------------------------
+    // -- normalising and serde ----------------------------------------------
 
     #[test]
-    fn an_unambiguous_transcript_raises_no_candidates() {
-        let t = track("the quick brown fox jumps over the lazy dog");
-        assert!(candidate_spans(&t, &[]).is_empty());
-    }
-
-    #[test]
-    fn a_discourse_marker_is_proposed_not_removed() {
-        let t = track("it basically tastes like chicken");
-        let c = candidate_spans(&t, &[]);
-        assert_eq!(
-            c.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
-            vec!["basically", "like"],
-            "both are ambiguous; neither may be cut by rule alone"
-        );
-    }
-
-    #[test]
-    fn a_two_word_marker_is_one_candidate() {
-        let t = track("you know we need more time");
-        let c = candidate_spans(&t, &[]);
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].text, "you know");
-        assert_eq!(c[0].indices, vec![0, 1]);
-    }
-
-    #[test]
-    fn a_phrase_is_preferred_over_its_first_word_alone() {
-        // "kind" is not in the ambiguous word list, but "kind of" is a phrase;
-        // "sort of" would otherwise be proposed as a bare "sort".
-        let t = track("it is sort of hard to say");
-        let c = candidate_spans(&t, &[]);
-        assert_eq!(c[0].text, "sort of");
-        assert_eq!(c[0].indices, vec![2, 3]);
-    }
-
-    #[test]
-    fn candidates_skip_words_already_removed() {
-        let t = track("um so I went");
-        let removals = propose_fillers(&t);
-        let removed: Vec<u32> = removals.iter().map(|r| r.index).collect();
-        let c = candidate_spans(&t, &removed);
-        // "um" is gone by rule; only "so" is left to judge.
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].text, "so");
-    }
-
-    #[test]
-    fn a_hesitation_between_the_halves_does_not_hide_a_phrase() {
-        let t = track("you um know we need more time");
-        let removed: Vec<u32> = propose_fillers(&t).iter().map(|r| r.index).collect();
-        let c = candidate_spans(&t, &removed);
-        assert_eq!(c[0].text, "you know", "matched over surviving words");
-        assert_eq!(c[0].indices, vec![0, 2]);
-    }
-
-    #[test]
-    fn the_judge_sees_the_sentence_as_it_will_be_heard() {
-        let t = track("um so I went to the store");
-        let removed: Vec<u32> = propose_fillers(&t).iter().map(|r| r.index).collect();
-        let c = candidate_spans(&t, &removed);
-        // "um" is hidden because it is already cut, and "so" is marked.
-        assert_eq!(judge_context(&t, &removed, &c[0]), "<<so>> I went to the store");
-    }
-
-    #[test]
-    fn the_judge_context_marks_a_phrase_as_one_unit() {
-        let t = track("so the thing is you know we need time");
-        let c = candidate_spans(&t, &[]);
-        let phrase = c.iter().find(|c| c.text == "you know").unwrap();
-        assert_eq!(
-            judge_context(&t, &[], phrase),
-            "so the thing is <<you know>> we need time"
-        );
-    }
-
-    #[test]
-    fn a_question_is_not_a_tic() {
-        // Measured: a judge turned "do you know what time it is" into "do what
-        // time it is". The grammar settles it, so the span is never proposed.
-        for q in [
-            "do you know what time it is",
-            "did you know about this",
-            "would you know where it is",
-            "I cant tell if you know the answer",
-        ] {
-            let t = track(q);
-            let c = candidate_spans(&t, &[]);
-            assert!(
-                !c.iter().any(|c| c.text.to_lowercase() == "you know"),
-                "{q:?} proposed \"you know\" as filler: {c:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_bare_you_know_is_still_proposed() {
-        let t = track("you know we need more time");
-        let c = candidate_spans(&t, &[]);
-        assert_eq!(c[0].text, "you know");
-    }
-
-    #[test]
-    fn a_you_know_mid_sentence_is_still_proposed() {
-        let t = track("the thing is you know we need more time");
-        let c = candidate_spans(&t, &[]);
-        assert!(c.iter().any(|c| c.text == "you know"), "{c:?}");
-    }
-
-    #[test]
-    fn the_interrogative_guard_does_not_swallow_other_phrases() {
-        // Only phrases starting with "you" are affected.
-        let t = track("do I mean it");
-        let c = candidate_spans(&t, &[]);
-        assert!(c.iter().any(|c| c.text == "I mean"), "{c:?}");
-    }
-
-    #[test]
-    fn only_filler_verdicts_become_removals() {
-        let t = track("it basically tastes like chicken");
-        let c = candidate_spans(&t, &[]);
-        let judged = vec![
-            Judgement { candidate: c[0].clone(), verdict: Verdict::Filler },
-            Judgement { candidate: c[1].clone(), verdict: Verdict::Content },
-        ];
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &removals_from_judgements(&judged));
-        assert_eq!(plan.text(&t), "it tastes like chicken");
-    }
-
-    #[test]
-    fn a_filler_phrase_verdict_removes_every_word_of_it() {
-        let t = track("you know we need more time");
-        let c = candidate_spans(&t, &[]);
-        let judged = vec![Judgement { candidate: c[0].clone(), verdict: Verdict::Content }];
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &removals_from_judgements(&judged));
-        assert_eq!(plan.text(&t), "you know we need more time");
-
-        let judged = vec![Judgement { candidate: c[0].clone(), verdict: Verdict::Filler }];
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &removals_from_judgements(&judged));
-        assert_eq!(plan.text(&t), "we need more time");
-    }
-
-    #[test]
-    fn judging_cannot_introduce_a_word() {
-        // The judge's whole output space is two words, neither of which is text.
-        let t = track("it basically tastes like chicken");
-        let c = candidate_spans(&t, &[]);
-        let judged: Vec<Judgement> = c
-            .iter()
-            .map(|c| Judgement { candidate: c.clone(), verdict: Verdict::Filler })
-            .collect();
-        let mut plan = EditPlan::unedited(&t);
-        apply_removals(&mut plan, &removals_from_judgements(&judged));
-        let spoken: Vec<String> = t.words.iter().map(|w| normalize(&w.text)).collect();
-        assert!(plan.text(&t).split_whitespace().all(|w| spoken.contains(&normalize(w))));
-        plan.validate(&t).unwrap();
-    }
-
-    #[test]
-    fn a_verdict_round_trips_as_the_judge_sends_it() {
-        assert_eq!(
-            serde_json::from_str::<Verdict>(r#""filler""#).unwrap(),
-            Verdict::Filler
-        );
-        assert_eq!(
-            serde_json::from_str::<Verdict>(r#""content""#).unwrap(),
-            Verdict::Content
-        );
+    fn normalising_ignores_case_and_punctuation() {
+        assert_eq!(normalize("Um,"), "um");
+        assert_eq!(normalize("don't"), "dont");
+        assert_eq!(normalize("..."), "");
+        assert_eq!(normalize("42"), "42");
     }
 
     #[test]
@@ -1383,8 +935,6 @@ mod tests {
         assert_eq!(w.confidence, None);
     }
 
-    // -- serde --------------------------------------------------------------
-
     #[test]
     fn a_plan_survives_a_round_trip() {
         let plan = EditPlan { kept: vec![0, 2, 5], max_gap_ms: Some(250), pad_ms: 30 };
@@ -1393,16 +943,8 @@ mod tests {
     }
 
     #[test]
-    fn a_proposal_parses_from_the_model_s_json() {
-        let json = r#"{"deletions":[{"index":0,"word":"um","reason":"hesitation"}]}"#;
-        let p: DeletionProposal = serde_json::from_str(json).unwrap();
-        assert_eq!(p.deletions[0].reason, Some(RemovalReason::Hesitation));
-    }
-
-    #[test]
-    fn a_proposal_parses_without_a_reason() {
-        let json = r#"{"deletions":[{"index":0,"word":"um"}]}"#;
-        let p: DeletionProposal = serde_json::from_str(json).unwrap();
-        assert_eq!(p.deletions[0].reason, None);
+    fn a_removal_reason_travels_as_snake_case() {
+        assert_eq!(serde_json::to_string(&RemovalReason::Ai).unwrap(), r#""ai""#);
+        assert_eq!(serde_json::to_string(&RemovalReason::Manual).unwrap(), r#""manual""#);
     }
 }

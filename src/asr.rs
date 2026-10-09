@@ -147,11 +147,15 @@ mod tests {
     #[test]
     fn the_fixture_drops_straight_into_the_edit_model() {
         // The point of the contract: what the GPU service returns is already a
-        // WordTrack, with no remapping step to get wrong.
+        // WordTrack, with no remapping step to get wrong, and an edit of it
+        // binds back onto the recording.
         let r: TranscribeResponse = serde_json::from_str(FIXTURE).unwrap();
         let track = WordTrack::new(r.words);
         assert_eq!(track.len(), 6);
-        assert!(crate::edit::is_hesitation(&track.words[0].text));
+        assert_eq!(track.text(), "um so I went to the");
+
+        let kept = crate::edit::bind_edit(&track.words, "I went to the").unwrap();
+        assert_eq!(kept, vec![2, 3, 4, 5]);
     }
 
     #[test]
