@@ -277,12 +277,15 @@ impl TierPricing {
         self.tier.get_description().to_string()
     }
 
+    /// The features Stripe says this plan includes.
+    ///
+    /// Empty when Stripe has not been configured, and deliberately so. There
+    /// used to be a hardcoded fallback here, which meant an unconfigured Stripe
+    /// rendered a pricing page claiming features the backend does not grant.
+    /// A pricing page showing nothing is recoverable; one making promises
+    /// nobody can keep is not.
     pub fn features(&self) -> Vec<String> {
-        if !self.feature_names.is_empty() {
-            self.feature_names.clone()
-        } else {
-            self.tier.get_features().into_iter().map(String::from).collect()
-        }
+        self.feature_names.clone()
     }
 }
 
@@ -315,64 +318,64 @@ pub struct BillingCycleInfo {
 
 /// Subscription tiers.
 ///
-/// Premium is the only plan on sale. `Basic` and `Standard` are deprecated:
-/// they exist solely so the subscriptions still running on them keep
-/// resolving, and are removed once nobody is left on either. `Free` is
-/// likewise closed to new accounts but still held by grandfathered ones.
+/// One plan, sold on several billing cycles. There is no ladder and no legacy
+/// tier, because nothing has ever been sold on this product: the inherited
+/// Basic and Standard existed only to keep a sibling product's subscriptions
+/// resolving, and carrying them here would be carrying someone else's history.
 ///
-/// The deprecation is deliberate noise — every remaining reference becomes a
-/// compiler warning, so the eventual removal is a mechanical sweep rather than
-/// another hunt through the codebase.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Hash, Eq, Copy)]
+/// `Ord` follows the variant order, so Free is below Premium and an upgrade
+/// comparison needs no table.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Hash, Eq, Copy, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Free,
-    #[deprecated(note = "Legacy tier, not sold. Remove once no subscribers remain.")]
-    Basic,
-    #[deprecated(note = "Legacy tier, not sold. Remove once no subscribers remain.")]
-    Standard,
     Premium,
 }
 
 impl Display for Tier {
-    // Legacy tiers still have to render for the subscribers on them.
-    #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let tier_str = match self {
+        let name = match self {
             Tier::Free => "Free",
-            Tier::Basic => "Basic",
-            Tier::Standard => "Standard",
             Tier::Premium => "Premium",
         };
-        write!(f, "{}", tier_str)
+        write!(f, "{name}")
+    }
+}
+
+impl Tier {
+    /// Resolve a stored or Stripe-supplied tier name.
+    ///
+    /// Normalised first, because a name arrives from Stripe metadata and from
+    /// stored subscription rows in whatever shape someone typed it. Without
+    /// this, "Premium " or "premium_plan" falls through to the default and a
+    /// paying customer is silently served the free plan.
+    pub fn parse(name: &str) -> Option<Tier> {
+        let normalised: String = name
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        match normalised.as_str() {
+            "free" => Some(Tier::Free),
+            "premium" | "premiumplan" | "paid" => Some(Tier::Premium),
+            _ => None,
+        }
     }
 }
 
 impl From<String> for Tier {
-    // Legacy tier names still appear in stored subscription metadata.
-    #[allow(deprecated)]
     fn from(s: String) -> Self {
-        match s.to_lowercase().as_str() {
-            "free" => Tier::Free,
-            "basic" => Tier::Basic,
-            "standard" => Tier::Standard,
-            "premium" => Tier::Premium,
-            _ => Tier::Free, // Default to Free for invalid values
-        }
+        Tier::from(s.as_str())
     }
 }
 
 impl From<&str> for Tier {
-    // Legacy tier names still appear in stored subscription metadata.
-    #[allow(deprecated)]
+    /// Unrecognised names resolve to Free, which is the safe direction: a
+    /// typo must never grant a paid plan. `parse` is the form to use where the
+    /// difference matters.
     fn from(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "free" => Tier::Free,
-            "basic" => Tier::Basic,
-            "standard" => Tier::Standard,
-            "premium" => Tier::Premium,
-            _ => Tier::Free, // Default to Free for invalid values
-        }
+        Tier::parse(s).unwrap_or(Tier::Free)
     }
 }
 
@@ -494,55 +497,20 @@ impl From<&str> for BillingCycle {
 }
 
 impl Tier {
-    /// Every tier that can still be held, sellable or not. Used for ranking and
-    /// for resolving existing subscriptions, never for building a pricing page.
-    #[allow(deprecated)]
+    /// Every tier that exists.
     pub fn all_tiers() -> Vec<Tier> {
-        vec![Tier::Free, Tier::Basic, Tier::Standard, Tier::Premium]
+        vec![Tier::Free, Tier::Premium]
     }
 
-    #[allow(deprecated)]
+    /// Whether this tier is sold.
+    pub fn is_paid(&self) -> bool {
+        matches!(self, Tier::Premium)
+    }
+
     pub fn get_description(&self) -> &str {
         match self {
-            Tier::Basic => "For small communities.",
-            Tier::Standard => "For growing communities.",
-            Tier::Premium => "Access to all Premium perks.",
-            _ => "Free tier with limited features.",
-        }
-    }
-
-    /// The feature list shown on a pricing card. Premium's is self-contained
-    /// because it is the only tier ever rendered for sale; the legacy lists
-    /// stay only for a subscriber looking at the plan they are already on.
-    #[allow(deprecated)]
-    pub fn get_features(&self) -> Vec<&'static str> {
-        match self {
-            Tier::Basic => vec![
-                "Access to Observer Model",
-                "Discord Bot and Rest API Access",
-                "Context Awareness",
-            ],
-            Tier::Standard => vec![
-                "Everything in Basic",
-                "Access to Sentinel Model",
-                "Image Moderation",
-                "Custom Bot Appearance",
-                "Implicit Moderation",
-            ],
-            Tier::Premium => vec![
-                "Access to Observer, Sentinel and Arbiter Models",
-                "Discord Bot and Rest API Access",
-                "Context Awareness",
-                "Image Moderation",
-                "Video Moderation",
-                "Implicit Moderation",
-                "Custom Bot Appearance",
-                "Platform API (Earn Money)",
-            ],
-            _ => vec![
-                "Access to Observer Model",
-                "Discord Bot and Rest API Access",
-            ],
+            Tier::Free => "Record, transcribe and edit by hand.",
+            Tier::Premium => "Everything, including one-button cleanup.",
         }
     }
 }
@@ -591,6 +559,89 @@ pub struct InvoicesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn there_is_one_paid_plan() {
+        assert_eq!(Tier::all_tiers(), vec![Tier::Free, Tier::Premium]);
+        assert!(Tier::Premium.is_paid());
+        assert!(!Tier::Free.is_paid());
+    }
+
+    #[test]
+    fn a_tier_name_is_normalised_before_being_matched() {
+        // These arrive from Stripe metadata and stored subscription rows in
+        // whatever shape someone typed. Falling through to Free on any of them
+        // would serve a paying customer the free plan.
+        for name in ["Premium", "premium", " premium ", "PREMIUM", "premium_plan", "Premium-Plan"] {
+            assert_eq!(Tier::parse(name), Some(Tier::Premium), "{name:?}");
+        }
+        for name in ["Free", " free", "FREE"] {
+            assert_eq!(Tier::parse(name), Some(Tier::Free), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_tier_name_is_reported_rather_than_guessed() {
+        assert_eq!(Tier::parse("enterprise"), None);
+        assert_eq!(Tier::parse(""), None);
+        // The lossy conversion still exists for stored values, and errs
+        // towards Free, because a typo must never grant a paid plan.
+        assert_eq!(Tier::from("enterprise"), Tier::Free);
+    }
+
+    #[test]
+    fn a_tier_round_trips_through_its_wire_form() {
+        for t in Tier::all_tiers() {
+            let json = serde_json::to_string(&t).unwrap();
+            assert_eq!(json, format!("\"{}\"", t.to_string().to_lowercase()));
+            assert_eq!(serde_json::from_str::<Tier>(&json).unwrap(), t);
+        }
+    }
+
+    #[test]
+    fn premium_outranks_free_without_a_lookup_table() {
+        assert!(Tier::Premium > Tier::Free);
+        let mut tiers = vec![Tier::Premium, Tier::Free];
+        tiers.sort();
+        assert_eq!(tiers, vec![Tier::Free, Tier::Premium]);
+    }
+
+    #[test]
+    fn an_unconfigured_stripe_advertises_nothing() {
+        // The bug this replaces: a hardcoded fallback meant an unconfigured
+        // Stripe rendered a pricing page promising features the backend does
+        // not grant.
+        let pricing = TierPricing {
+            tier: Tier::Premium,
+            prices: std::collections::HashMap::new(),
+            monthly_credits: None,
+            feature_names: vec![],
+        };
+        assert!(pricing.features().is_empty());
+    }
+
+    #[test]
+    fn features_come_from_stripe_verbatim() {
+        let pricing = TierPricing {
+            tier: Tier::Premium,
+            prices: std::collections::HashMap::new(),
+            monthly_credits: Some(36_000),
+            feature_names: vec!["Clean up recordings with one button".to_string()],
+        };
+        assert_eq!(pricing.features(), vec!["Clean up recordings with one button"]);
+    }
+
+    #[test]
+    fn a_description_describes_this_product() {
+        for t in Tier::all_tiers() {
+            let d = t.get_description();
+            assert!(d.ends_with('.'), "{t:?}: {d}");
+            for leak in ["communities", "moderation", "bot", "Discord", "server"] {
+                assert!(!d.contains(leak), "{t:?} still describes another product: {d}");
+            }
+        }
+    }
+
 
     #[test]
     fn every_cycle_but_triennial_can_be_trialled() {
