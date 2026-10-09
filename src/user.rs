@@ -80,5 +80,11 @@ pub struct TimeSeriesPoint {
 pub struct PublicStatsResponse {
     pub user_count: i64,
     pub user_growth: Vec<TimeSeriesPoint>,
-    pub member_growth: Vec<TimeSeriesPoint>,
+    /// Recordings made over the period.
+    ///
+    /// Replaces an inherited `member_growth`, which read a `member_count`
+    /// metric that was Discord server members. Nothing in this product ever
+    /// wrote it, so the series was permanently empty behind a label that meant
+    /// nothing here.
+    pub recording_growth: Vec<TimeSeriesPoint>,
 }
