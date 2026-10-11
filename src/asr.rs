@@ -1,9 +1,8 @@
 //! The contract with `paraphrase-audio-api`, the GPU service.
 //!
 //! That service decodes audio into a word track and does nothing else. It does
-//! not judge filler and it does not cut audio: the rules and the judge live in
-//! the backend next to the edit model they produce, and the cut has to run in
-//! the backend because the inference container mounts the media volume
+//! not judge filler and it does not cut audio: the edit model is called from
+//! the backend, and the cut has to run in the backend because the inference container mounts the media volume
 //! read-only and only ever sees a 16kHz mono proxy of the master.
 //!
 //! [`TranscribeResponse`] denies unknown fields on purpose. The two sides of

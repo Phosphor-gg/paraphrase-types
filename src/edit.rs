@@ -500,9 +500,13 @@ pub enum EditRejection {
     /// `replace` uses a word that nobody said anywhere in the passage.
     ///
     /// This is the one that protects the product: there is no audio for it.
-    /// Note it is checked against the whole passage, not against `find`, because
-    /// reusing a word from elsewhere is legitimate.
     NotSpoken { word: String },
+    /// `replace` uses a word that was said, but not inside its own `find`, or
+    /// uses one more often than `find` has it. The word's audio is still kept
+    /// where it was said, so taking it again would play it twice: that is how
+    /// "the pool was the thing I was worried about" came back as "the pool was
+    /// the pool which I was worried about".
+    NotInFind { word: String },
     /// Applying it would leave the passage with nothing in it.
     RemovesEverything,
 }
@@ -524,6 +528,11 @@ impl std::fmt::Display for EditRejection {
                 "{word:?} was never said, so there is no audio for it; use only words from the \
                  passage"
             ),
+            Self::NotInFind { word } => write!(
+                f,
+                "{word:?} is not among the words you quoted in find, so using it would play it \
+                 twice; a replace can only leave out or rearrange the words of its own find"
+            ),
             Self::RemovesEverything => write!(f, "that would delete the whole passage"),
         }
     }
@@ -531,7 +540,7 @@ impl std::fmt::Display for EditRejection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RejectedEdit {
-    /// Which edit in the reply, so feedback can name it.
+    /// Which edit in the reply.
     pub index: usize,
     pub rejection: EditRejection,
 }
@@ -549,9 +558,10 @@ pub struct EditOutcome {
 ///
 /// This is the whole mechanism, and what makes it safe is not a rule the model
 /// is asked to follow but the resolution step: every word of `replace` is
-/// resolved to an index of a word that was actually spoken, and a word that
-/// resolves to nothing is refused. Deleting, reordering and repeating all fall
-/// out of that, because all three are just a different sequence of indices.
+/// resolved to the index of a word spoken inside the matched `find`, each at
+/// most once, and a word that resolves to nothing is refused. Deleting and
+/// reordering both fall out of that, because both are just a different
+/// sequence of indices.
 ///
 /// Edits apply in order against the result so far, so a later `find` sees what
 /// earlier edits produced, exactly as a sequence of patches to a file does. A
@@ -613,46 +623,53 @@ pub fn apply_edits(window: &[Word], edits: &[Edit]) -> EditOutcome {
         };
         let span = at..at + needle.len();
 
-        // Resolve each replacement word to a word that was actually spoken.
+        // Resolve each replacement word to a word of the matched span. Only the
+        // span: a word from outside it is still kept where it was said, so
+        // taking it again would play it twice.
         let mut resolved: Vec<u32> = Vec::new();
         let mut taken: Vec<bool> = vec![false; span.len()];
-        let mut invented: Option<String> = None;
+        let mut refused: Option<EditRejection> = None;
+        // Where the previous word came from. A repeated word resolves to its
+        // next copy after that one before any earlier copy, so "which is a web
+        // application which allows" -> "a web application which allows" keeps
+        // the second "which" and is a deletion, not a move of the first.
+        let mut after: Option<usize> = None;
 
         for token in edit.replace.split_whitespace() {
             let want = normalize(token);
             if want.is_empty() {
                 continue;
             }
-            // Prefer an unused word from inside the matched span, so an
-            // unchanged word keeps its own audio and a reorder stays local.
-            let from_span = span
+            let unused = |offset: usize, position: usize| {
+                !taken[offset]
+                    && position_of.get(&kept[position]).is_some_and(|p| normalised[*p] == want)
+            };
+            let in_order = span
                 .clone()
                 .enumerate()
-                .find(|(offset, position)| {
-                    !taken[*offset]
-                        && position_of
-                            .get(&kept[*position])
-                            .is_some_and(|p| normalised[*p] == want)
-                });
-            if let Some((offset, position)) = from_span {
-                taken[offset] = true;
-                resolved.push(kept[position]);
-                continue;
-            }
-            // Then any word in the passage, which is what lets a word be
-            // repeated or pulled in from nearby.
-            match window.iter().position(|w| normalize(&w.text) == want) {
-                Some(position) => resolved.push(window[position].index),
+                .find(|&(offset, position)| after.is_none_or(|a| offset > a) && unused(offset, position));
+            let anywhere = || span.clone().enumerate().find(|&(offset, position)| unused(offset, position));
+            match in_order.or_else(anywhere) {
+                Some((offset, position)) => {
+                    taken[offset] = true;
+                    after = Some(offset);
+                    resolved.push(kept[position]);
+                }
                 None => {
-                    invented = Some(token.to_string());
+                    let word = token.to_string();
+                    let spoken = window.iter().any(|w| normalize(&w.text) == want);
+                    refused = Some(if spoken {
+                        EditRejection::NotInFind { word }
+                    } else {
+                        EditRejection::NotSpoken { word }
+                    });
                     break;
                 }
             }
         }
 
-        if let Some(word) = invented {
-            rejected
-                .push(RejectedEdit { index: ordinal, rejection: EditRejection::NotSpoken { word } });
+        if let Some(rejection) = refused {
+            rejected.push(RejectedEdit { index: ordinal, rejection });
             continue;
         }
 
@@ -670,12 +687,6 @@ pub fn apply_edits(window: &[Word], edits: &[Edit]) -> EditOutcome {
     }
 
     EditOutcome { kept, applied, rejected }
-}
-
-/// Whether an edit keeps any of the passage at all.
-pub fn keeps_any_word(window: &[Word], kept: &[u32]) -> bool {
-    let _ = window;
-    !kept.is_empty()
 }
 
 /// Split a track into windows to edit separately.
@@ -911,26 +922,58 @@ mod tests {
     }
 
     #[test]
-    fn a_word_can_be_repeated_because_its_audio_can_be_reused() {
-        // The speaker said "Friday" once; the edit says it twice. There is
-        // audio for both, because it is the same audio.
+    fn a_word_cannot_be_used_more_often_than_find_has_it() {
+        // "Friday" was said once and is kept where it was said; saying it again
+        // would play the same audio twice.
         let t = track("the deadline is Friday");
         let out = apply_edits(&t.words, &[edit("is Friday", "is Friday Friday")]);
-        assert_eq!(out.applied, 1, "{:?}", out.rejected);
-        let plan = EditPlan { kept: out.kept, max_gap_ms: None, pad_ms: 0 };
-        assert_eq!(plan.text(&t), "the deadline is Friday Friday");
-        plan.validate(&t).unwrap();
+        assert_eq!(out.applied, 0);
+        assert_eq!(out.rejected[0].rejection, EditRejection::NotInFind { word: "Friday".into() });
+        assert_eq!(out.kept, (0..4).collect::<Vec<u32>>());
     }
 
     #[test]
-    fn a_replacement_may_borrow_a_word_from_elsewhere_in_the_passage() {
-        // "Friday" is outside the matched span, but it was spoken, so it has
-        // audio and may be used.
+    fn a_replacement_cannot_borrow_a_word_from_outside_its_find() {
+        // "Friday" was spoken, but outside the matched span, where it is still
+        // kept. Borrowing it would play it twice.
         let t = track("we ship on Friday and we talk on Monday");
         let out = apply_edits(&t.words, &[edit("we talk on Monday", "we talk on Friday")]);
+        assert_eq!(out.applied, 0);
+        assert_eq!(out.rejected[0].rejection, EditRejection::NotInFind { word: "Friday".into() });
+        assert_eq!(out.kept, (0..9).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn deleting_around_a_repeated_word_stays_a_deletion() {
+        // Two "which"es. Leaving out the first pair keeps the second "which"
+        // in place; matching the first copy instead would turn a deletion into
+        // a move that sounds the same but splices, and reverting that move
+        // would give "which a web application allows".
+        let t = track("paraphrase which is a web application which allows you");
+        let out = apply_edits(
+            &t.words,
+            &[edit("which is a web application which allows", "a web application which allows")],
+        );
+        assert_eq!(out.applied, 1, "{:?}", out.rejected);
+        assert_eq!(out.kept, vec![0, 3, 4, 5, 6, 7, 8]);
+        assert!(!is_reordered(&out.kept));
+    }
+
+    #[test]
+    fn a_moved_word_still_finds_its_copy_when_it_comes_earlier() {
+        // In-order matching is a preference, not a rule: a word the edit moves
+        // earlier still resolves to the copy that was said later.
+        let t = track("the meeting got moved to Thursday the budget meeting");
+        let out = apply_edits(
+            &t.words,
+            &[edit(
+                "the meeting got moved to Thursday the budget meeting",
+                "the budget meeting got moved to Thursday",
+            )],
+        );
         assert_eq!(out.applied, 1, "{:?}", out.rejected);
         let plan = EditPlan { kept: out.kept, max_gap_ms: None, pad_ms: 0 };
-        assert_eq!(plan.text(&t), "we ship on Friday and we talk on Friday");
+        assert_eq!(plan.text(&t), "the budget meeting got moved to Thursday");
     }
 
     #[test]
@@ -1108,6 +1151,7 @@ mod tests {
             EditRejection::NotFound { find: "x y".into() },
             EditRejection::Ambiguous { find: "the".into(), occurrences: 3 },
             EditRejection::NotSpoken { word: "Thursday".into() },
+            EditRejection::NotInFind { word: "Friday".into() },
             EditRejection::RemovesEverything,
         ] {
             let m = r.to_string();
