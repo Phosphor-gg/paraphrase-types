@@ -32,6 +32,11 @@ use serde::{Deserialize, Serialize};
 /// Default padding kept either side of a word so a cut does not clip its edges.
 pub const DEFAULT_PAD_MS: u32 = 30;
 
+/// The shortest fade at any edge of a kept span, wherever the pad there was
+/// clamped to nothing: long enough that the splice does not click, too short
+/// to hear as a fade.
+pub const EDGE_FADE_MS: u32 = 6;
+
 /// A transcribed word and the span of audio that produced it.
 ///
 /// Unknown fields are rejected for the same reason [`crate::asr::TranscribeResponse`]
@@ -244,6 +249,13 @@ impl EditPlan {
     /// and rejoined. Padding is clamped to half the silence either side, which
     /// is what stops a 30ms pad from leaving the tail of a removed "um"
     /// audible.
+    ///
+    /// Each span fades in across the pad before its first word and out across
+    /// the pad after its last. The clamp is measured against word timestamps,
+    /// and those are coarser than the audio: a removed neighbour's first or
+    /// last sound often sits inside the pad all the same. Fading across the
+    /// pad takes that edge down with it, and makes every splice a fade rather
+    /// than a step.
     pub fn keep_intervals(&self, track: &WordTrack) -> Vec<Interval> {
         let mut out: Vec<Interval> = Vec::new();
         let mut prev_index: Option<u32> = None;
@@ -280,19 +292,32 @@ impl EditPlan {
                         // Keep only `max` of the pause, split across the join so
                         // neither word starts abruptly.
                         let head = max / 2;
-                        out.last_mut().expect("checked non-empty").end_ms = prev_end + head;
+                        let last = out.last_mut().expect("checked non-empty");
+                        last.end_ms = prev_end + head;
+                        last.fade_out_ms = head;
                         out.push(Interval {
                             start_ms: w.start_ms.saturating_sub(max - head),
                             end_ms: end,
+                            fade_in_ms: max - head,
+                            fade_out_ms: right,
                         });
                     }
-                    _ => out.last_mut().expect("checked non-empty").end_ms = end,
+                    _ => {
+                        let last = out.last_mut().expect("checked non-empty");
+                        last.end_ms = end;
+                        last.fade_out_ms = right;
+                    }
                 }
                 prev_index = Some(i);
                 continue;
             }
 
-            out.push(Interval { start_ms: start, end_ms: end });
+            out.push(Interval {
+                start_ms: start,
+                end_ms: end,
+                fade_in_ms: left,
+                fade_out_ms: right,
+            });
             prev_index = Some(i);
         }
         out
@@ -309,11 +334,46 @@ impl EditPlan {
 pub struct Interval {
     pub start_ms: u32,
     pub end_ms: u32,
+    /// How long the span fades in from its start: the pad kept before its
+    /// first word.
+    #[serde(default)]
+    pub fade_in_ms: u32,
+    /// How long it fades out to its end: the pad kept after its last word.
+    #[serde(default)]
+    pub fade_out_ms: u32,
 }
 
 impl Interval {
+    /// A span with no fade of its own (it still gets [`EDGE_FADE_MS`]).
+    pub fn new(start_ms: u32, end_ms: u32) -> Self {
+        Self { start_ms, end_ms, fade_in_ms: 0, fade_out_ms: 0 }
+    }
+
     pub fn duration_ms(&self) -> u32 {
         self.end_ms.saturating_sub(self.start_ms)
+    }
+
+    /// The fades to play this span with, the same in the editor's playback and
+    /// in the export: its own, never shorter than [`EDGE_FADE_MS`], and never
+    /// more than half the span each, so the two cannot overlap.
+    pub fn fades_ms(&self) -> (u32, u32) {
+        let half = self.duration_ms() / 2;
+        (
+            self.fade_in_ms.max(EDGE_FADE_MS).min(half),
+            self.fade_out_ms.max(EDGE_FADE_MS).min(half),
+        )
+    }
+
+    /// The span stopped at `limit` (the end of its file), or `None` if nothing
+    /// of it is left. Its fade-out loses what was cut off, because that much
+    /// of the pad no longer exists.
+    pub fn ending_by(self, limit: u32) -> Option<Self> {
+        let end_ms = self.end_ms.min(limit);
+        (end_ms > self.start_ms).then_some(Self {
+            end_ms,
+            fade_out_ms: self.fade_out_ms.saturating_sub(self.end_ms - end_ms),
+            ..self
+        })
     }
 }
 
@@ -740,6 +800,15 @@ mod tests {
         WordTrack::from_text(text, 100)
     }
 
+    fn track_timed(words: &[(&str, u32, u32)]) -> WordTrack {
+        WordTrack::new(
+            words
+                .iter()
+                .enumerate()
+                .map(|(i, &(text, start, end))| Word::new(i as u32, text, start, end)),
+        )
+    }
+
     fn spoken(track: &WordTrack) -> Vec<String> {
         track.words.iter().map(|w| normalize(&w.text)).collect()
     }
@@ -890,6 +959,51 @@ mod tests {
         let t = track("zero one two three four five");
         let kept = bind_edit(&t.words[3..], "three five").unwrap();
         assert_eq!(kept, vec![3, 5]);
+    }
+
+    // -- fades ------------------------------------------------------------
+
+    #[test]
+    fn a_span_fades_across_the_pad_it_was_given() {
+        // "a" ends at 300, "b" (cut) runs 400..700, "c" starts at 800. With a
+        // 120ms pad, "a" gets half the 100ms silence after it, 50ms, and that
+        // 50ms is its fade-out; before it there are 100ms of file, all of it.
+        let t = track_timed(&[("a", 100, 300), ("b", 400, 700), ("c", 800, 1000)]);
+        let plan = EditPlan { kept: vec![0, 2], max_gap_ms: None, pad_ms: 120 };
+        let spans = plan.keep_intervals(&t);
+        assert_eq!(spans[0], Interval { start_ms: 0, end_ms: 350, fade_in_ms: 100, fade_out_ms: 50 });
+        assert_eq!(spans[1], Interval { start_ms: 750, end_ms: 1120, fade_in_ms: 50, fade_out_ms: 120 });
+    }
+
+    #[test]
+    fn continuous_speech_fades_only_at_its_ends() {
+        let t = track_timed(&[("a", 100, 300), ("b", 320, 500), ("c", 520, 700)]);
+        let plan = EditPlan { kept: vec![0, 1, 2], max_gap_ms: None, pad_ms: 120 };
+        let spans = plan.keep_intervals(&t);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].fade_in_ms, spans[0].fade_out_ms), (100, 120));
+    }
+
+    #[test]
+    fn a_fade_never_goes_below_a_declick_or_past_half_the_span() {
+        assert_eq!(Interval::new(0, 1000).fades_ms(), (EDGE_FADE_MS, EDGE_FADE_MS));
+        let short = Interval { start_ms: 0, end_ms: 100, fade_in_ms: 120, fade_out_ms: 120 };
+        assert_eq!(short.fades_ms(), (50, 50));
+    }
+
+    #[test]
+    fn stopping_a_span_at_its_file_end_shortens_its_fade() {
+        let span = Interval { start_ms: 100, end_ms: 1120, fade_in_ms: 50, fade_out_ms: 120 };
+        let cut = span.ending_by(1050).unwrap();
+        assert_eq!((cut.end_ms, cut.fade_out_ms), (1050, 50));
+        assert_eq!(span.ending_by(2000), Some(span));
+        assert_eq!(span.ending_by(100), None);
+    }
+
+    #[test]
+    fn an_interval_without_fades_still_deserialises() {
+        let span: Interval = serde_json::from_str(r#"{"start_ms":1,"end_ms":2}"#).unwrap();
+        assert_eq!(span, Interval::new(1, 2));
     }
 
     // -- find/replace edits -------------------------------------------------
