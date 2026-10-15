@@ -755,32 +755,36 @@ pub fn apply_edits(window: &[Word], edits: &[Edit]) -> EditOutcome {
 /// particular sentence, and a megabyte of transcript is slow besides. Windows
 /// are also independent, so they can be edited concurrently.
 ///
-/// Boundaries prefer the end of a sentence in the last quarter of the window,
-/// because a cut landing mid-clause removes the context needed to judge the
-/// words either side of it. Reordering cannot cross a window boundary, which is
-/// an accepted limit: moving a clause between distant parts of a recording is
-/// not something this feature promises.
+/// A window holds whole sentences only: as many as fit in `target_words`, or
+/// one sentence on its own when it is longer than that. A window that ends
+/// mid-sentence hands the model half a sentence to judge on each side of the
+/// seam. Reordering cannot cross a window boundary, which is an accepted limit:
+/// moving a clause between distant parts of a recording is not something this
+/// feature promises.
 pub fn chunk_ranges(track: &WordTrack, target_words: usize) -> Vec<(usize, usize)> {
-    if track.is_empty() {
-        return Vec::new();
-    }
     let target = target_words.max(1);
+    // Backstop, not the rule: speech transcribed with no sentence punctuation
+    // at all has no sentence end to honour, and is cut at this length rather
+    // than sent as one unbounded window.
+    let longest = target * 4;
     let mut out = Vec::new();
     let mut start = 0usize;
 
     while start < track.len() {
-        let limit = (start + target).min(track.len());
-        if limit == track.len() {
-            out.push((start, limit));
-            break;
-        }
-        let earliest = start + (target * 3 / 4).max(1);
-        let mut end = limit;
-        for position in (earliest..limit).rev() {
-            if ends_sentence(&track.words[position].text) {
-                end = position + 1;
-                break;
+        let mut end = start;
+        let mut position = start;
+        while position < track.len() && position - start < longest {
+            let sentence_end = ends_sentence(&track.words[position].text);
+            position += 1;
+            if sentence_end || position == track.len() {
+                if end > start && position - start > target {
+                    break;
+                }
+                end = position;
             }
+        }
+        if end == start {
+            end = position;
         }
         out.push((start, end));
         start = end;
@@ -807,6 +811,52 @@ mod tests {
                 .enumerate()
                 .map(|(i, &(text, start, end))| Word::new(i as u32, text, start, end)),
         )
+    }
+
+    fn windows(text: &str, target: usize) -> Vec<String> {
+        let t = track(text);
+        chunk_ranges(&t, target)
+            .into_iter()
+            .map(|(a, b)| {
+                t.words[a..b]
+                    .iter()
+                    .map(|w| w.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_window_never_ends_mid_sentence() {
+        assert_eq!(
+            windows("One two three. Four five six seven. Eight nine.", 5),
+            ["One two three.", "Four five six seven.", "Eight nine."]
+        );
+        assert_eq!(
+            windows("One two. Three four. Five six seven eight nine ten.", 4),
+            ["One two. Three four.", "Five six seven eight nine ten."]
+        );
+    }
+
+    #[test]
+    fn sentences_that_fit_share_a_window() {
+        assert_eq!(
+            windows("A b. C d. E f. G h.", 6),
+            ["A b. C d. E f.", "G h."]
+        );
+    }
+
+    #[test]
+    fn unpunctuated_speech_is_still_bounded() {
+        let text = vec!["word"; 50].join(" ");
+        let ranges = chunk_ranges(&track(&text), 10);
+        assert_eq!(ranges, [(0, 40), (40, 50)]);
+    }
+
+    #[test]
+    fn an_empty_track_has_no_windows() {
+        assert!(chunk_ranges(&track(""), 10).is_empty());
     }
 
     fn spoken(track: &WordTrack) -> Vec<String> {
