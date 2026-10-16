@@ -16,6 +16,50 @@ use std::fmt::Display;
 /// plan's whole monthly credit allowance either way.
 pub const TRIAL_PERIOD_DAYS: u32 = 7;
 
+/// What a plan allows beyond its credits.
+///
+/// Shared so the backend that enforces these and the site that explains them
+/// state the same numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanLimits {
+    /// AI cleanups a day, counted per UTC day.
+    pub cleanups_per_day: u32,
+    /// The longest a project may be: every take in it, end to end.
+    pub project_secs: u32,
+}
+
+pub const FREE_LIMITS: PlanLimits = PlanLimits {
+    cleanups_per_day: 3,
+    project_secs: 5 * 60,
+};
+
+pub const PREMIUM_LIMITS: PlanLimits = PlanLimits {
+    cleanups_per_day: 30,
+    project_secs: 4 * 60 * 60,
+};
+
+impl PlanLimits {
+    pub fn for_plan(premium: bool) -> Self {
+        if premium { PREMIUM_LIMITS } else { FREE_LIMITS }
+    }
+
+    /// The project length in words: "5 minutes", "4 hours".
+    pub fn project_length(&self) -> String {
+        describe_secs(self.project_secs)
+    }
+}
+
+/// A length in whole hours and minutes, for a sentence: "1 hour 30 minutes".
+pub fn describe_secs(secs: u32) -> String {
+    let unit = |n: u32, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+    let (hours, minutes) = (secs / 3600, (secs % 3600) / 60);
+    match (hours, minutes) {
+        (0, m) => unit(m.max(1), "minute"),
+        (h, 0) => unit(h, "hour"),
+        (h, m) => format!("{} {}", unit(h, "hour"), unit(m, "minute")),
+    }
+}
+
 /// Credits per 1 GBP. Based on £2.00 = 1,500,000 credits.
 pub const CREDITS_PER_GBP: f64 = 750_000.0;
 
@@ -559,6 +603,24 @@ pub struct InvoicesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn premium_allows_more_than_free() {
+        assert_eq!(FREE_LIMITS.cleanups_per_day, 3);
+        assert_eq!(PREMIUM_LIMITS.cleanups_per_day, 30);
+        assert_eq!(FREE_LIMITS.project_length(), "5 minutes");
+        assert_eq!(PREMIUM_LIMITS.project_length(), "4 hours");
+        assert_eq!(PlanLimits::for_plan(true), PREMIUM_LIMITS);
+        assert_eq!(PlanLimits::for_plan(false), FREE_LIMITS);
+    }
+
+    #[test]
+    fn lengths_read_as_words() {
+        assert_eq!(describe_secs(60), "1 minute");
+        assert_eq!(describe_secs(20), "1 minute");
+        assert_eq!(describe_secs(3600), "1 hour");
+        assert_eq!(describe_secs(5400), "1 hour 30 minutes");
+    }
 
     #[test]
     fn there_is_one_paid_plan() {
